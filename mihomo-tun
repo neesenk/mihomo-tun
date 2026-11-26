@@ -920,8 +920,9 @@ EOF
   if [ -n "$TAILNET_CIDRS" ]; then
     svc start routes
   fi
-  if [ "$OS" = darwin ]; then
-    launchctl disable "system/$MIHOMO_LABEL" 2>/dev/null   # 防止开机时带着示例配置自启
+  # 防止开机时带着示例配置自启;已经在运行的(重复 install)保持原样
+  if [ "$OS" = darwin ] && ! mihomo_active; then
+    launchctl disable "system/$MIHOMO_LABEL" 2>/dev/null
   fi
 
   cat >&2 <<EOF
@@ -1368,35 +1369,104 @@ cmd_verify() {
   return $fail
 }
 
-cmd_fetch_mihomo() {
-  need_root fetch-mihomo
-  load_conf
+# mihomo_release [版本]: 查询 GitHub release,设置 REL_VER / REL_URL
+mihomo_release() {
   have curl || die "需要 curl"
-  local arch ver api json url tmp name
+  local arch api json name
   case "$(uname -m)" in
     x86_64|amd64)  arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
     armv7*)        arch=armv7 ;;
     *) die "不支持的架构: $(uname -m)" ;;
   esac
-  ver=${1:-}
-  if [ -n "$ver" ]; then api=https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/$ver
+  if [ -n "${1:-}" ]; then api=https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/$1
   else api=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest; fi
   json=$(curl -fsSL "$api") || die "获取版本信息失败: $api"
-  ver=$(echo "$json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4)
-  for name in "mihomo-$OS-$arch-$ver.gz" "mihomo-$OS-$arch-compatible-$ver.gz" "mihomo-$OS-$arch-v1-$ver.gz"; do
-    url=$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*/$name\"" | cut -d'"' -f4)
-    [ -n "$url" ] && break
+  REL_VER=$(echo "$json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4)
+  REL_URL=""
+  for name in "mihomo-$OS-$arch-$REL_VER.gz" "mihomo-$OS-$arch-compatible-$REL_VER.gz" "mihomo-$OS-$arch-v1-$REL_VER.gz"; do
+    REL_URL=$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*/$name\"" | cut -d'"' -f4)
+    [ -n "$REL_URL" ] && break
   done
-  [ -n "$url" ] || die "在 $ver 中没找到 $OS-$arch 的二进制"
-  info "下载 $url"
+  [ -n "$REL_URL" ] || die "在 $REL_VER 中没找到 $OS-$arch 的二进制"
+}
+
+# mihomo_download <url> <目标文件>: 下载并解压为可执行文件
+mihomo_download() {
+  local tmp
+  info "下载 $1"
   tmp=$(mktemp -d)
-  curl -fL --progress-bar -o "$tmp/mihomo.gz" "${MIHOMO_DOWNLOAD_PREFIX:-}$url" || { rm -rf "$tmp"; die "下载失败"; }
+  curl -fL --progress-bar -o "$tmp/mihomo.gz" "${MIHOMO_DOWNLOAD_PREFIX:-}$1" || { rm -rf "$tmp"; die "下载失败"; }
   gunzip "$tmp/mihomo.gz" || { rm -rf "$tmp"; die "解压失败"; }
-  mkdir -p "$(dirname "$MIHOMO_BIN")"
-  install -m 0755 "$tmp/mihomo" "$MIHOMO_BIN"
+  mkdir -p "$(dirname "$2")"
+  install -m 0755 "$tmp/mihomo" "$2"
   rm -rf "$tmp"
+}
+
+# 当前 mihomo 版本(如 v1.19.15),没有则为空
+mihomo_version() {
+  [ -x "$MIHOMO_BIN" ] || return 0
+  "$MIHOMO_BIN" -v 2>/dev/null | grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1
+}
+
+mihomo_active() {
+  if [ "$OS" = linux ]; then systemctl is-active --quiet "$MIHOMO_UNIT.service"
+  else launchctl print "system/$MIHOMO_LABEL" >/dev/null 2>&1; fi
+}
+
+tun_up() { ifconfig "$TUN_DEVICE" >/dev/null 2>&1 || ip link show "$TUN_DEVICE" >/dev/null 2>&1; }
+
+cmd_fetch_mihomo() {
+  need_root fetch-mihomo
+  load_conf
+  mihomo_release "${1:-}"
+  mihomo_download "$REL_URL" "$MIHOMO_BIN"
   "$MIHOMO_BIN" -v
+}
+
+# update [版本] [--force]: 升级 mihomo;新版本校验当前配置通过后才替换,
+# 运行中的 mihomo 会重启,重启后 TUN 没起来则自动换回旧版本
+cmd_update() {
+  need_root update
+  load_conf
+  local want="" force=0 cur new bak i
+  while [ $# -gt 0 ]; do
+    case $1 in --force|-f) force=1 ;; -*) die "未知参数: $1" ;; *) want=$1 ;; esac
+    shift
+  done
+  [ -x "$MIHOMO_BIN" ] || die "未找到 $MIHOMO_BIN,请先执行: sudo $0 fetch-mihomo"
+  cur=$(mihomo_version)
+  mihomo_release "$want"
+  if [ "$cur" = "$REL_VER" ] && [ $force = 0 ]; then
+    info "mihomo 已是 $REL_VER,无需升级(强制重装加 --force)"
+    return 0
+  fi
+  info "mihomo ${cur:-未知版本} -> $REL_VER"
+
+  new=$MIHOMO_BIN.new
+  bak=$MIHOMO_BIN.bak
+  mihomo_download "$REL_URL" "$new"
+  "$new" -v >/dev/null 2>&1 || { rm -f "$new"; die "新版本无法运行"; }
+  if [ -f "$MIHOMO_DIR/config.yaml" ]; then
+    local out
+    out=$("$new" -t -d "$MIHOMO_DIR" 2>&1) || { echo "$out" >&2; rm -f "$new"; die "新版本校验当前配置失败,未替换"; }
+  fi
+  cp -p "$MIHOMO_BIN" "$bak"
+  mv -f "$new" "$MIHOMO_BIN"   # rename 替换,运行中的旧进程不受影响
+
+  if mihomo_active; then
+    info "重启 mihomo"
+    svc restart mihomo
+    for i in $(seq 1 30); do tun_up && break; sleep 0.5; done
+    if ! tun_up; then
+      warn "新版本启动后 TUN 网卡 $TUN_DEVICE 没有出现,换回 ${cur:-旧版本}"
+      mv -f "$bak" "$MIHOMO_BIN"
+      svc restart mihomo
+      die "升级失败,已回滚(日志: journalctl -u $MIHOMO_UNIT / log show)"
+    fi
+    [ "$OS" = darwin ] && cmd_dns_up
+  fi
+  info "已升级到 $("$MIHOMO_BIN" -v 2>/dev/null | head -1)(旧版本备份在 $bak)"
 }
 
 usage() {
@@ -1424,6 +1494,7 @@ mihomo-tun $VERSION — Tailscale 网络下的 mihomo TUN 全局代理 ($OS)
   routes-up | routes-down 手动添加 / 删除路由规则
   dns-up | dns-down       手动设置 / 撤销分流 DNS
   fetch-mihomo [版本]     从 GitHub 下载 mihomo 到 MIHOMO_BIN(默认最新版)
+  update [版本] [--force] 升级 mihomo 并重启;校验配置失败或启动失败时保留 / 换回旧版本
   run                     (供服务调用)生成配置并以前台方式运行 mihomo
 
 配置目录: $CONF_DIR  (可用环境变量 MIHOMO_TUN_CONF_DIR 覆盖)
@@ -1450,6 +1521,7 @@ case $cmd in
   dns-up)       cmd_dns_up ;;
   dns-down)     cmd_dns_down ;;
   fetch-mihomo) cmd_fetch_mihomo "$@" ;;
+  update)       cmd_update "$@" ;;
   version|-v|--version) echo "mihomo-tun $VERSION" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
