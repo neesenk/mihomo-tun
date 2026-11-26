@@ -1338,7 +1338,11 @@ cmd_verify() {
     echo "== 分流 DNS (应解析为 fake-ip $FAKE_IP_RANGE) =="
     split_dns_reachable || echo "警告: $SPLIT_DNS_HINT"
     for d in $doms; do
-      got=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR == 1 { print $1 }')
+      if [ "$OS" = darwin ]; then
+        got=$(dscacheutil -q host -a name "$d" 2>/dev/null | awk '/^ip_address:/ { print $2; exit }')
+      else
+        got=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR == 1 { print $1 }')
+      fi
       if [ -n "$got" ] && in_cidr "$got" "$FAKE_IP_RANGE"; then
         printf 'OK   %-24s -> %s\n' "$d" "$got"
       else
@@ -1379,7 +1383,7 @@ cmd_fetch_mihomo() {
   if [ -n "$ver" ]; then api=https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/$ver
   else api=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest; fi
   json=$(curl -fsSL "$api") || die "获取版本信息失败: $api"
-  ver=$(echo "$json" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+  ver=$(echo "$json" | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4)
   for name in "mihomo-$OS-$arch-$ver.gz" "mihomo-$OS-$arch-compatible-$ver.gz" "mihomo-$OS-$arch-v1-$ver.gz"; do
     url=$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*/$name\"" | cut -d'"' -f4)
     [ -n "$url" ] && break
