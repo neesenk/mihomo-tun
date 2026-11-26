@@ -1,0 +1,81 @@
+# mihomo-tun 配置(shell 语法,多个值用空格分隔)
+# 修改后执行: sudo mihomo-tun restart
+
+# ---------------- Tailscale / 路由 ----------------
+# 真正属于 tailnet 的网段,走 Tailscale(必填)
+TAILNET_CIDRS="100.81.1.0/24"
+
+# MagicDNS 地址,走 Tailscale;*.ts.net 域名用它解析。留空则不处理
+MAGICDNS_IP=100.100.100.100
+# [仅 Linux] 在 systemd-resolved 的 Tailscale 网卡上配置 MagicDNS,让系统能解析 *.ts.net 与节点短名
+#   auto: tailscale 未开 accept-dns 时配置; yes: 总是配置; no: 不配置
+# 不建议在 /etc/resolv.conf 不是 resolved stub 的机器上开 accept-dns: tailscale 会进入 direct 模式改写 resolv.conf
+MAGICDNS_LINK=auto
+# tailnet 域名后缀(用作短名的搜索域),auto 从 tailscale status 读取
+MAGICDNS_SUFFIX=auto
+
+# 走本地网络、不进 TUN 的网段。
+# 100.0.0.0/8 用来覆盖 Tailscale 默认接管的 100.64.0.0/10(本地网络也在用 100.x 时需要)
+LOCAL_CIDRS="100.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+# Tailscale 网卡名。auto: Linux 为 tailscale0,macOS 自动识别 utunN
+TS_IFACE=auto
+
+# [仅 Linux] 局域网里有 100.x 设备要主动访问本机时,填写本机局域网网卡名,
+# 会在 Tailscale 的 ts-input 链中放行这些包
+LAN_IFACE=""
+
+# [仅 Linux] 策略路由优先级起点:tailnet 规则占 BASE..BASE+9,本地规则占 BASE+10 起;
+# 全部必须小于 Tailscale 的 5210
+RULE_PRIORITY_BASE=5190
+TS_TABLE=52
+
+# ---------------- mihomo ----------------
+MIHOMO_BIN=/usr/local/bin/mihomo
+# mihomo 工作目录(生成的 config.yaml、缓存、geo 数据),默认 <配置目录>/mihomo
+#MIHOMO_DIR=
+LOG_LEVEL=info
+MIXED_PORT=7890
+ALLOW_LAN=false
+# 管理面板 API,例如 127.0.0.1:9090;留空不开启
+EXTERNAL_CONTROLLER=""
+EXTERNAL_SECRET=""
+
+# TUN 设备名。auto: Linux 为 mihomo-tun,macOS 为 utun225(macOS 只能用 utunN)
+TUN_DEVICE=auto
+TUN_STACK=mixed
+# TUN 地址,留空用 mihomo 默认的 198.18.0.1/30
+TUN_ADDRESS=""
+TUN_MTU=1400
+# [仅 Linux] mihomo 策略路由规则的起始优先级(会占用 N、N+1、N+2、N+10)。
+# auto: 本机在用 Tailscale exit node 时为 5255(必须在 Tailscale 的 5250 之后、5270 之前),否则用 mihomo 默认的 9000
+TUN_RULE_INDEX=auto
+
+# 分流 DNS: 把 rules 中 DOMAIN / DOMAIN-SUFFIX(策略不是 DIRECT/TAILSCALE)的域名交给 mihomo 解析成 fake-ip,
+# 使这些域名的流量一定进 TUN。Linux 用 systemd-resolved,macOS 用 /etc/resolver
+SPLIT_DNS=yes
+# 手动指定域名(空格分隔),留空则从 rules 自动提取
+SPLIT_DNS_DOMAINS=""
+# TUN 内用于接收 DNS 的地址(需在 TUN 网段内,改了 TUN_ADDRESS 时同步修改)
+TUN_DNS=198.18.0.2
+
+DNS_LISTEN=127.0.0.1:1053
+# mihomo 的上游 DNS。auto: 使用系统当前的 DNS(内网域名需要它);也可手动写,如 "10.134.0.0 223.5.5.5"
+DNS_NAMESERVERS=auto
+FAKE_IP_RANGE=198.18.0.1/16
+FAKE_IP_FILTER="+.ts.net +.lan +.local"
+
+# 连接代理节点时绑定 Tailscale 网卡(节点是 tailnet 内的机器时必须为 yes)
+PROXY_VIA_TAILSCALE=yes
+# 代理节点组:名字(proxies.yaml 的 rules 里引用)与类型 select | url-test | fallback | load-balance
+PROXY_GROUP=PROXY
+PROXY_GROUP_TYPE=select
+HEALTH_CHECK_URL=https://www.gstatic.com/generate_204
+# 没有命中任何规则时的策略:DIRECT、PROXY、TAILSCALE
+# auto: 在用 exit node 时为 TAILSCALE(继续经 exit node 出网),否则为 DIRECT。开关 exit node 后需 sudo mihomo-tun restart
+FINAL_POLICY=auto
+
+# ---------------- verify ----------------
+# 默认取 proxies.yaml 中第一个 server
+#VERIFY_PROXY_IP=100.81.1.10
+VERIFY_LAN_IP=192.168.1.1

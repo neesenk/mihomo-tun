@@ -1,0 +1,1452 @@
+#!/usr/bin/env bash
+# mihomo-tun: 在 Tailscale 网络下用 mihomo TUN 做全局代理 (Linux / macOS)
+#
+#   - tailnet 网段 / MagicDNS 走 Tailscale
+#   - 其余 100.x 与私有网段走本地网络,不进 TUN
+#   - 公网流量进 mihomo TUN,按规则分流;代理节点经 tailnet 访问
+#
+# 用法见: mihomo-tun help
+# 注意: 需兼容 macOS 自带的 bash 3.2(不用关联数组、mapfile、${x,,} 等)
+
+set -o pipefail
+set -f            # 关闭通配符展开,配置里的 "*.lan" 之类不会被当成文件名
+
+VERSION=1.0.0
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin:$PATH
+
+case "$(uname -s)" in
+  Linux)  OS=linux ;;
+  Darwin) OS=darwin ;;
+  *) echo "不支持的系统: $(uname -s)" >&2; exit 1 ;;
+esac
+
+if [ "$OS" = darwin ]; then
+  DEFAULT_CONF_DIR=/usr/local/etc/mihomo-tun
+  STATE_DIR=/var/run/mihomo-tun
+else
+  DEFAULT_CONF_DIR=/etc/mihomo-tun
+  STATE_DIR=/run/mihomo-tun
+fi
+CONF_DIR=${MIHOMO_TUN_CONF_DIR:-$DEFAULT_CONF_DIR}
+CONF_FILE=$CONF_DIR/mihomo-tun.conf
+PROXIES_FILE=$CONF_DIR/proxies.yaml
+LEGACY_RULES_FILE=$CONF_DIR/rules.txt   # 旧版独立规则文件,仍兼容读取
+BIN_PATH=/usr/local/bin/mihomo-tun
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+SELF=$SELF_DIR/$(basename "$0")
+
+# 服务名
+ROUTES_UNIT=mihomo-tun-routes          # systemd
+MIHOMO_UNIT=mihomo-tun
+ROUTES_LABEL=local.mihomo-tun.routes   # launchd
+MIHOMO_LABEL=local.mihomo-tun.mihomo
+LAUNCHD_DIR=/Library/LaunchDaemons
+
+# 生成的配置里固定使用的名字
+TS_DIRECT=TAILSCALE      # 绑定 Tailscale 网卡的直连出口
+SYSTEM_POLICY=SYSTEM     # 规则策略:按没有 mihomo 时的系统路由走
+PROVIDER=nodes
+
+# ---------------------------------------------------------------- 工具函数
+info() { echo "[mihomo-tun] $*" >&2; }
+warn() { echo "[mihomo-tun] 警告: $*" >&2; }
+die()  { echo "[mihomo-tun] 错误: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+need_root() { [ "$(id -u)" = 0 ] || die "请用 sudo 运行: sudo $0 $*"; }
+
+ip2int() { local IFS=.; set -- $1; echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )); }
+
+# in_cidr <IP> <CIDR>
+in_cidr() {
+  local net=${2%/*} len=${2#*/} m
+  [ "$len" = "$2" ] && len=32
+  m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  [ $(( $(ip2int "$1") & m )) -eq $(( $(ip2int "$net") & m )) ]
+}
+
+is_ipv4() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+
+# yaml_section <文件> <顶层键>: 输出该顶层键下的内容(不含键本身那一行)
+yaml_section() {
+  awk -v want="$2" '
+    /^[A-Za-z0-9_.-]+[[:space:]]*:/ { k = $0; sub(/[[:space:]]*:.*/, "", k); insec = (k == want); next }
+    insec { print }' "$1"
+}
+
+# 列出文件中的顶层键
+yaml_top_keys() {
+  sed -n 's/^\([A-Za-z0-9_.-]*\)[[:space:]]*:.*/\1/p' "$1"
+}
+
+# 把规则列表("- RULE" 或每行一条)规范成纯规则行
+normalize_rules() {
+  sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' -e 's/^[[:space:]]*-[[:space:]]*//' \
+      -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" | grep -v '^$'
+}
+
+# 找出被前面更宽的 DOMAIN-SUFFIX / 相同 DOMAIN 覆盖、永远匹配不到的规则
+lint_rules() {
+  yaml_section "$PROXIES_FILE" rules | normalize_rules | awk -F, '
+    $1 == "DOMAIN" || $1 == "DOMAIN-SUFFIX" {
+      d = tolower($2)
+      for (i = 1; i <= n; i++) {
+        s = key[i]
+        hit = (d == s) || (kind[i] == "DOMAIN-SUFFIX" && length(d) > length(s) && substr(d, length(d) - length(s)) == "." s)
+        if (hit && !(kind[i] == "DOMAIN" && $1 == "DOMAIN-SUFFIX")) {
+          printf "规则 \"%s\" 被前面的 \"%s\" 覆盖,永远匹配不到(需要时把它挪到前面)\n", $0, line[i]; break
+        }
+      }
+      n++; key[n] = d; kind[n] = $1; line[n] = $0
+    }'
+}
+
+# "类型,内容,SYSTEM[,参数]" -> "SUB-RULE,(类型,内容),SYSTEM"
+expand_system_rules() {
+  sed -E "s/^(.*),$SYSTEM_POLICY(,[A-Za-z-]+)*\$/SUB-RULE,(\1),$SYSTEM_POLICY/"
+}
+
+# proxies.yaml 中的节点名(支持 "- name: x" 和 "- { name: x, ... }";名字里不能有空格)
+proxy_names() {
+  yaml_section "$PROXIES_FILE" proxies | grep -v '^[[:space:]]*#' \
+    | sed -nE 's/^[[:space:]]*-?[[:space:]]*\{?[[:space:]]*name:[[:space:]]*["'\'']?([^"'\'',}[:space:]]+).*/\1/p'
+}
+
+yaml_list() {  # yaml_list <缩进> <项...>
+  local ind=$1 x; shift
+  for x in "$@"; do printf '%s- "%s"\n' "$ind" "$x"; done
+}
+
+# ---------------------------------------------------------------- 配置
+load_conf() {
+  # 默认值;用户配置见 mihomo-tun.conf.example
+  TS_IFACE=auto
+  TAILNET_CIDRS=""
+  MAGICDNS_IP=100.100.100.100
+  MAGICDNS_LINK=auto
+  MAGICDNS_SUFFIX=auto
+  LOCAL_CIDRS="100.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+  LAN_IFACE=""
+  RULE_PRIORITY_BASE=5190
+  TS_TABLE=52
+
+  MIHOMO_BIN=/usr/local/bin/mihomo
+  MIHOMO_DIR=""
+  LOG_LEVEL=info
+  MIXED_PORT=7890
+  ALLOW_LAN=false
+  EXTERNAL_CONTROLLER=""
+  EXTERNAL_SECRET=""
+
+  TUN_DEVICE=auto
+  TUN_STACK=mixed
+  TUN_ADDRESS=""
+  TUN_MTU=1400
+  TUN_RULE_INDEX=auto
+
+  SPLIT_DNS=yes
+  SPLIT_DNS_DOMAINS=""
+  TUN_DNS=198.18.0.2
+
+  DNS_LISTEN=127.0.0.1:1053
+  DNS_NAMESERVERS=auto
+  FAKE_IP_RANGE=198.18.0.1/16
+  FAKE_IP_FILTER="+.ts.net +.lan +.local"
+
+  PROXY_VIA_TAILSCALE=yes
+  PROXY_GROUP=PROXY
+  PROXY_GROUP_TYPE=select
+  HEALTH_CHECK_URL=https://www.gstatic.com/generate_204
+  FINAL_POLICY=auto
+
+  VERIFY_PROXY_IP=""
+  VERIFY_LAN_IP=192.168.1.1
+
+  if [ -f "$CONF_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF_FILE"
+  fi
+
+  [ -n "$MIHOMO_DIR" ] || MIHOMO_DIR=$CONF_DIR/mihomo
+
+  # 本机用了 Tailscale exit node 时:
+  #   mihomo 的策略路由要排到 Tailscale 的 5270 之前(否则公网流量全被 exit node 拿走,进不了 TUN);
+  #   未命中规则的流量走 TAILSCALE 出口,保持经 exit node 出网
+  EXIT_NODE=0
+  ts_exit_node_active && EXIT_NODE=1
+  if [ "$TUN_RULE_INDEX" = auto ]; then
+    if [ "$OS" = linux ] && [ $EXIT_NODE = 1 ]; then TUN_RULE_INDEX=5255; else TUN_RULE_INDEX=""; fi
+  fi
+  if [ "$FINAL_POLICY" = auto ]; then
+    if [ $EXIT_NODE = 1 ]; then FINAL_POLICY=$TS_DIRECT; else FINAL_POLICY=DIRECT; fi
+  fi
+  if [ "$TUN_DEVICE" = auto ]; then
+    # macOS 的 TUN 设备名必须是 utunN
+    if [ "$OS" = darwin ]; then TUN_DEVICE=utun225; else TUN_DEVICE=mihomo-tun; fi
+  fi
+}
+
+ts_exit_node_active() {
+  if [ "$OS" = linux ]; then
+    ip -4 route show table "${TS_TABLE:-52}" 2>/dev/null | grep -q '^default '
+  else
+    ts_cli debug prefs 2>/dev/null | grep -Eq '"ExitNodeID": *"[^"]+"'
+  fi
+}
+
+check_conf() {
+  [ -f "$CONF_FILE" ] || die "未找到 $CONF_FILE,请先执行 sudo $0 install"
+  [ -n "$TAILNET_CIDRS" ] || die "$CONF_FILE 中 TAILNET_CIDRS 未设置"
+  local c
+  for c in $TAILNET_CIDRS $LOCAL_CIDRS; do
+    is_ipv4 "${c%/*}" || die "无效网段: $c"
+  done
+}
+
+# 所有不进 TUN 的网段
+# mihomo 的上游 DNS。auto: 用系统当前的 DNS(内网域名才能解析),取不到时退回公共 DNS
+dns_servers() {
+  if [ "$DNS_NAMESERVERS" != auto ]; then echo $DNS_NAMESERVERS; return; fi
+  local list=""
+  if [ "$OS" = linux ]; then
+    list=$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf 2>/dev/null)
+    # resolv.conf 指向 resolved 的 stub 时,取 resolved 的上游
+    if echo "$list" | grep -q '^127\.' && have resolvectl; then
+      list=$(resolvectl dns 2>/dev/null | sed 's/^[^:]*://' | tr ' ' '\n')
+    fi
+  else
+    list=$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/ { print $3 }')
+  fi
+  # 去掉回环、IPv6、TUN / fake-ip 网段、MagicDNS
+  list=$(echo "$list" | grep -E '^[0-9.]+$' | grep -v '^127\.' | grep -vx "${MAGICDNS_IP:-x}" | while read -r ip; do
+    in_cidr "$ip" "$FAKE_IP_RANGE" || echo "$ip"
+  done | awk '!seen[$0]++')
+  if [ -n "$list" ]; then echo $list; else echo 223.5.5.5 119.29.29.29; fi
+}
+
+bypass_cidrs() {
+  echo $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32} $LOCAL_CIDRS
+}
+
+# 代理节点地址(取 proxies.yaml 中第一个 server)
+first_server() {
+  [ -f "$PROXIES_FILE" ] || return 0
+  grep -Eo 'server:[[:space:]]*["'\'']?[^",'\''}[:space:]]+' "$PROXIES_FILE" | head -1 \
+    | sed -E 's/server:[[:space:]]*["'\'']?//'
+}
+
+# ---------------------------------------------------------------- Tailscale 网卡
+ts_cli() {
+  local c
+  for c in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+    if have "$c" || [ -x "$c" ]; then "$c" "$@"; return; fi
+  done
+  return 127
+}
+
+# 输出 Tailscale 网卡名;Linux 固定 tailscale0,macOS 是动态的 utunN
+ts_iface() {
+  if [ "$TS_IFACE" != auto ]; then echo "$TS_IFACE"; return 0; fi
+  if [ "$OS" = linux ]; then echo tailscale0; return 0; fi
+
+  local ts_ip i addrs
+  ts_ip=$(ts_cli ip -4 2>/dev/null | head -1)
+  for i in $(ifconfig -l); do
+    case $i in utun*) ;; *) continue ;; esac
+    addrs=$(ifconfig "$i" 2>/dev/null | awk '/inet /{print $2}')
+    [ -n "$addrs" ] || continue
+    if [ -n "$ts_ip" ]; then
+      echo "$addrs" | grep -qx "$ts_ip" && { echo "$i"; return 0; }
+    else
+      # 拿不到 CLI 时,取第一个带 100.64.0.0/10 地址的 utun
+      echo "$addrs" | grep -Eq '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' && { echo "$i"; return 0; }
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 路由: Linux
+# 输出 "优先级|网段|路由表"
+# tailnet 规则用 BASE..BASE+9,本地规则用 BASE+10..;都必须小于 Tailscale 的 5210
+linux_rules() {
+  local p=$RULE_PRIORITY_BASE c
+  for c in $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32}; do
+    echo "$p|$c|$TS_TABLE"; p=$((p + 1))
+  done
+  p=$((RULE_PRIORITY_BASE + 10))
+  for c in $LOCAL_CIDRS; do
+    echo "$p|$c|main"; p=$((p + 1))
+  done
+}
+
+linux_check_prio() {
+  local n_ts n_local
+  set -- $TAILNET_CIDRS; n_ts=$(( $# + 1 ))
+  set -- $LOCAL_CIDRS;   n_local=$#
+  [ "$n_ts" -le 10 ] || die "TAILNET_CIDRS 最多 9 个"
+  [ $((RULE_PRIORITY_BASE + 10 + n_local)) -le 5210 ] \
+    || die "RULE_PRIORITY_BASE($RULE_PRIORITY_BASE)+10+LOCAL_CIDRS 数量 超过了 Tailscale 的 5210"
+}
+
+linux_del_prio_range() {
+  local p
+  for p in $(seq "$RULE_PRIORITY_BASE" $((RULE_PRIORITY_BASE + 19))); do
+    while ip -4 rule del priority "$p" 2>/dev/null; do :; done
+  done
+}
+
+# 局域网里有 100.x 设备主动访问本机时,Tailscale 的 ts-input 链会把它们当伪造源丢弃
+linux_fw() {  # linux_fw add|del
+  [ -n "$LAN_IFACE" ] || return 0
+  have iptables || { warn "未找到 iptables,跳过 LAN_IFACE 防火墙放行"; return 0; }
+  local c i
+  if [ "$1" = add ]; then
+    for i in $(seq 1 20); do
+      iptables -nL ts-input >/dev/null 2>&1 && break
+      sleep 1
+    done
+    iptables -nL ts-input >/dev/null 2>&1 || { warn "未找到 ts-input 链,跳过防火墙放行"; return 0; }
+    # 先放行 LAN 来的 100.64/10,再在其上方丢弃伪造 tailnet 源地址的包
+    iptables -C ts-input -i "$LAN_IFACE" -s 100.64.0.0/10 -j ACCEPT 2>/dev/null \
+      || iptables -I ts-input 1 -i "$LAN_IFACE" -s 100.64.0.0/10 -j ACCEPT
+    for c in $TAILNET_CIDRS; do
+      iptables -C ts-input -i "$LAN_IFACE" -s "$c" -j DROP 2>/dev/null \
+        || iptables -I ts-input 1 -i "$LAN_IFACE" -s "$c" -j DROP
+    done
+  else
+    iptables -nL ts-input >/dev/null 2>&1 || return 0
+    while iptables -D ts-input -i "$LAN_IFACE" -s 100.64.0.0/10 -j ACCEPT 2>/dev/null; do :; done
+    for c in $TAILNET_CIDRS; do
+      while iptables -D ts-input -i "$LAN_IFACE" -s "$c" -j DROP 2>/dev/null; do :; done
+    done
+  fi
+}
+
+linux_routes_up() {
+  linux_check_prio
+  linux_del_prio_range
+  local r p c t
+  for r in $(linux_rules); do
+    IFS='|' read -r p c t <<EOF
+$r
+EOF
+    ip -4 rule add priority "$p" to "$c" lookup "$t" || warn "添加规则失败: $r"
+  done
+  linux_fw add
+  linux_magicdns up
+}
+
+linux_routes_down() {
+  linux_del_prio_range
+  linux_fw del
+  linux_magicdns down
+}
+
+# ---- MagicDNS 解析(accept-dns 关闭时)
+# 在 systemd-resolved 的 tailscale0 上配置 MagicDNS,系统才能解析 *.ts.net 和节点短名。
+# resolved 发查询时绑定 tailscale0,不受其他"100.64/10 走 main"之类策略路由的影响。
+ts_prefs_corpdns() {  # 输出 true/false/空
+  ts_cli debug prefs 2>/dev/null | sed -n 's/.*"CorpDNS": *\([a-z]*\).*/\1/p' | head -1
+}
+
+ts_magicdns_suffix() {
+  if [ "$MAGICDNS_SUFFIX" != auto ]; then echo "$MAGICDNS_SUFFIX"; return; fi
+  ts_cli status --json 2>/dev/null | sed -n 's/.*"MagicDNSSuffix": *"\([^"]*\)".*/\1/p' | head -1
+}
+
+linux_magicdns() {  # up|down
+  [ -n "$MAGICDNS_IP" ] && [ "$MAGICDNS_LINK" != no ] || return 0
+  have resolvectl && systemctl is-active --quiet systemd-resolved || return 0
+  local ifc i suffix mark=$STATE_DIR/magicdns
+  ifc=$(ts_iface) || return 0
+  if [ "$1" = down ]; then
+    [ -f "$mark" ] || return 0
+    ip link show "$ifc" >/dev/null 2>&1 && resolvectl revert "$ifc" 2>/dev/null
+    rm -f "$mark"; resolvectl flush-caches 2>/dev/null
+    return 0
+  fi
+  # accept-dns 打开时由 tailscale 自己管理(auto 模式下跳过)
+  if [ "$MAGICDNS_LINK" = auto ] && [ "$(ts_prefs_corpdns)" = true ]; then
+    return 0
+  fi
+  for i in $(seq 1 40); do ip link show "$ifc" >/dev/null 2>&1 && break; sleep 0.5; done
+  ip link show "$ifc" >/dev/null 2>&1 || { warn "$ifc 不存在,跳过 MagicDNS 配置"; return 0; }
+  suffix=$(ts_magicdns_suffix)
+  set -- "~ts.net"
+  [ -n "$suffix" ] && set -- "$@" "$suffix"     # 不带 ~ 的同时作为搜索域,支持短名
+  if resolvectl dns "$ifc" "$MAGICDNS_IP" && resolvectl domain "$ifc" "$@" \
+     && resolvectl default-route "$ifc" false; then
+    mkdir -p "$STATE_DIR"; echo "$ifc" >"$mark"
+    resolvectl flush-caches 2>/dev/null
+    info "MagicDNS: $ifc -> $MAGICDNS_IP ($*)"
+    split_dns_reachable || warn "$SPLIT_DNS_HINT"
+  else
+    warn "在 $ifc 上配置 MagicDNS 失败"
+  fi
+}
+
+linux_routes_show() {
+  ip -4 rule | awk -F: -v lo="$RULE_PRIORITY_BASE" '($1 >= lo && $1 < lo + 20) || ($1 >= 5210 && $1 <= 5270)'
+}
+
+# ---------------------------------------------------------------- 路由: macOS
+# macOS 没有策略路由,用"更长前缀"覆盖 Tailscale 的 100.64.0.0/10:
+#   - LOCAL_CIDRS 中覆盖 100.64/10 的部分 -> 拆成两条 /11 指向物理网关
+#   - TAILNET_CIDRS / MagicDNS          -> 指向 Tailscale 的 utun
+# 其余私有网段本来就走默认路由(mihomo 也已排除),无需处理。
+ROUTES_STATE=$STATE_DIR/routes
+
+mac_default_gw() {  # 输出 "网关 网卡",忽略 utun
+  netstat -rn -f inet 2>/dev/null | awk '
+    /^Destination/ { for (i = 1; i <= NF; i++) { if ($i == "Netif") n = i; if ($i == "Flags") f = i }; next }
+    n && $1 == "default" && $2 ~ /^[0-9.]+$/ && $n !~ /^utun/ {
+      if ($f !~ /I/) { print $2, $n; found = 1; exit }
+      if (!alt) alt = $2 " " $n
+    }
+    END { if (!found && alt) print alt }'
+}
+
+mac_local_cidrs() {
+  local c len
+  for c in $LOCAL_CIDRS; do
+    len=${c#*/}; [ "$len" = "$c" ] && len=32
+    if [ "$len" -le 10 ] && in_cidr 100.64.0.0 "$c"; then
+      echo 100.64.0.0/11 100.96.0.0/11
+    elif in_cidr "${c%/*}" 100.64.0.0/10; then
+      echo "$c"
+    fi
+  done
+}
+
+# mac_route_ensure <CIDR> gw|iface <目标>
+# 先看当前实际走向,已经正确就不动,避免每次触发都抖动路由表
+mac_route_ensure() {
+  local cidr=$1 mode=$2 target=$3 dst flag cur_if cur_gw
+  local len=${cidr#*/}
+  if [ "$len" = 32 ] || [ "$len" = "$cidr" ]; then flag=-host; dst=${cidr%/*}; else flag=-net; dst=$cidr; fi
+
+  set -- $(route -n get "${cidr%/*}" 2>/dev/null | awk '/interface:/{i=$2} /gateway:/{g=$2} END{print i" "g}')
+  cur_if=${1:-}; cur_gw=${2:-}
+  if [ "$mode" = iface ]; then
+    [ "$cur_if" = "$target" ] && return 0
+    set -- "$flag" "$dst" -interface "$target"
+  else
+    [ "$cur_gw" = "$target" ] && return 0
+    set -- "$flag" "$dst" "$target"
+  fi
+  if route -q -n add "$@" >/dev/null 2>&1 || route -q -n change "$@" >/dev/null 2>&1; then
+    info "路由 $dst -> $target"
+    mkdir -p "$STATE_DIR"
+    grep -qx "$flag $dst" "$ROUTES_STATE" 2>/dev/null || echo "$flag $dst" >>"$ROUTES_STATE"
+  else
+    warn "设置路由失败: $dst -> $target"
+  fi
+}
+
+mac_routes_up() {
+  local gw ts_if c old
+  set -- $(mac_default_gw); gw=${1:-}
+  if [ -n "$gw" ]; then
+    for c in $(mac_local_cidrs); do mac_route_ensure "$c" gw "$gw"; done
+  else
+    warn "没有找到默认网关,跳过本地网段路由"
+  fi
+
+  if ts_if=$(ts_iface); then
+    for c in $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32}; do mac_route_ensure "$c" iface "$ts_if"; done
+    # Tailscale 重启后 utun 编号可能变化,mihomo 里绑定的网卡名需要跟着更新
+    old=$(cat "$STATE_DIR/ts_iface" 2>/dev/null)
+    if [ -n "$old" ] && [ "$old" != "$ts_if" ] && launchctl print "system/$MIHOMO_LABEL" >/dev/null 2>&1; then
+      info "Tailscale 网卡 $old -> $ts_if,重启 mihomo"
+      launchctl kickstart -k "system/$MIHOMO_LABEL"
+    fi
+  else
+    warn "未找到 Tailscale 网卡(Tailscale 未连接?),跳过 tailnet 路由"
+  fi
+}
+
+mac_routes_down() {
+  [ -f "$ROUTES_STATE" ] || return 0
+  local flag dst
+  while read -r flag dst; do
+    [ -n "$dst" ] && route -q -n delete "$flag" "$dst" >/dev/null 2>&1
+  done <"$ROUTES_STATE"
+  rm -f "$ROUTES_STATE"
+}
+
+mac_routes_show() {
+  netstat -rn -f inet | awk 'NR <= 4 && /^Destination/ || $1 ~ /^100(\.|\/|$)/ || $1 == "default"'
+}
+
+# ---------------------------------------------------------------- 生成 mihomo 配置
+render_yaml() {
+  local ts_if=$1 line c
+  cat <<EOF
+# 由 mihomo-tun 根据 $CONF_DIR 下的配置自动生成,请勿直接修改。
+# 修改配置后执行: sudo mihomo-tun restart
+mixed-port: $MIXED_PORT
+allow-lan: $ALLOW_LAN
+mode: rule
+log-level: $LOG_LEVEL
+ipv6: false
+unified-delay: true
+profile:
+  store-selected: true
+  store-fake-ip: true
+EOF
+  if [ -n "$EXTERNAL_CONTROLLER" ]; then
+    echo "external-controller: $EXTERNAL_CONTROLLER"
+    [ -n "$EXTERNAL_SECRET" ] && echo "secret: \"$EXTERNAL_SECRET\""
+  fi
+
+  cat <<EOF
+
+tun:
+  enable: true
+  stack: $TUN_STACK
+  device: $TUN_DEVICE
+  mtu: $TUN_MTU
+  auto-route: true               # 不开 auto-redirect,避免与 Tailscale 的 netfilter 规则冲突
+  auto-detect-interface: true
+  strict-route: false
+  dns-hijack:
+    - any:53
+EOF
+  if [ -n "$TUN_ADDRESS" ]; then
+    echo "  inet4-address:"
+    yaml_list "    " $TUN_ADDRESS
+  fi
+  if [ "$OS" = linux ] && [ -n "$TUN_RULE_INDEX" ]; then
+    echo "  iproute2-rule-index: $TUN_RULE_INDEX   # mihomo 的策略路由规则从这里开始"
+  fi
+  echo "  route-exclude-address:     # 这些网段不进 TUN"
+  yaml_list "    " $(bypass_cidrs)
+
+  cat <<EOF
+
+dns:
+  enable: true
+  listen: $DNS_LISTEN
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: $FAKE_IP_RANGE
+  fake-ip-filter:
+EOF
+  yaml_list "    " $FAKE_IP_FILTER
+  echo "  nameserver:"
+  yaml_list "    " $(dns_servers)
+  echo "  proxy-server-nameserver:"
+  yaml_list "    " $(dns_servers)
+  if [ -n "$MAGICDNS_IP" ]; then
+    # "#TAILSCALE" 让 DNS 查询经绑定 Tailscale 网卡的出口发出,
+    # 否则 auto-detect-interface 会把 socket 绑到物理网卡,MagicDNS 不可达
+    echo "  nameserver-policy:"
+    echo "    \"+.ts.net\": \"$MAGICDNS_IP#$TS_DIRECT\""
+  fi
+
+  cat <<EOF
+
+# 本机发往被排除的内网 DNS 的请求不经过 mihomo,
+# 此时域名规则依赖 sniffer 从 TLS SNI / HTTP Host 还原域名
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  # 只用嗅探到的域名做规则匹配,连接仍用原始 IP;
+  # 否则 mihomo 会用自己的 DNS 重新解析域名,内网域名可能解析失败或得到不同结果
+  override-destination: false
+  sniff:
+    TLS:  { ports: [443, 8443] }
+    HTTP: { ports: [80, 8080-8880] }
+    QUIC: { ports: [443] }
+
+proxies:
+  - name: $TS_DIRECT
+    type: direct
+    interface-name: $ts_if
+
+proxy-providers:
+  $PROVIDER:
+    type: file
+    path: ./providers/proxies.yaml
+EOF
+  if [ "$PROXY_VIA_TAILSCALE" = yes ]; then
+    cat <<EOF
+    override:
+      interface-name: $ts_if    # 关键: 连接代理节点的 socket 绑定 Tailscale 网卡,而不是物理网卡
+EOF
+  fi
+  case $PROXY_GROUP_TYPE in
+    url-test|fallback|load-balance)
+      cat <<EOF
+    health-check:
+      enable: true
+      url: $HEALTH_CHECK_URL
+      interval: 300
+EOF
+      ;;
+  esac
+
+  cat <<EOF
+
+proxy-groups:
+  - name: $PROXY_GROUP
+    type: $PROXY_GROUP_TYPE
+    use: [$PROVIDER]
+EOF
+  case $PROXY_GROUP_TYPE in
+    url-test|fallback|load-balance)
+      echo "    url: $HEALTH_CHECK_URL"
+      echo "    interval: 300"
+      ;;
+  esac
+
+  # 每个节点生成一个同名组,规则里可以直接写节点名(provider 里的节点本身不能被规则引用)
+  local n re
+  for n in $(proxy_names); do
+    case $n in "$PROXY_GROUP"|"$TS_DIRECT"|"$SYSTEM_POLICY"|DIRECT|REJECT|REJECT-DROP|PASS|COMPATIBLE) continue ;; esac
+    re=$(printf '%s' "$n" | sed 's/[][\\.^$*+?(){}|/]/\\&/g')
+    cat <<EOF
+  - name: $n
+    type: select
+    use: [$PROVIDER]
+    filter: "^$re\$"
+EOF
+  done
+
+  # rule-providers 原样透传(供 RULE-SET 规则使用)
+  if [ -n "$(yaml_section "$PROXIES_FILE" rule-providers | grep -v '^[[:space:]]*\(#.*\)\{0,1\}$')" ]; then
+    echo
+    echo "rule-providers:"
+    yaml_section "$PROXIES_FILE" rule-providers
+  fi
+
+  # SYSTEM: "就像没有 mihomo 一样" —— 本地/内网直连,tailnet 走 Tailscale,其余按 FINAL_POLICY
+  # (用了 exit node 时 FINAL_POLICY=TAILSCALE,即走 exit node)。规则里写策略 SYSTEM 即可使用
+  echo
+  echo "sub-rules:"
+  echo "  $SYSTEM_POLICY:"
+  for c in $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32}; do
+    echo "    - IP-CIDR,$c,$TS_DIRECT"
+  done
+  for c in $LOCAL_CIDRS; do
+    echo "    - IP-CIDR,$c,DIRECT"
+  done
+  echo "    - MATCH,$FINAL_POLICY"
+
+  echo
+  echo "rules:"
+  echo "  - DOMAIN-SUFFIX,ts.net,$TS_DIRECT"
+  for c in $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32}; do
+    echo "  - IP-CIDR,$c,$TS_DIRECT,no-resolve"
+  done
+  for c in $LOCAL_CIDRS; do
+    echo "  - IP-CIDR,$c,DIRECT,no-resolve"
+  done
+  echo "  # ---- $PROXIES_FILE 中的 rules"
+  yaml_section "$PROXIES_FILE" rules | normalize_rules | expand_system_rules | while IFS= read -r line; do
+    echo "  - $line"
+  done
+  if [ -f "$LEGACY_RULES_FILE" ]; then
+    echo "  # ---- $LEGACY_RULES_FILE(旧版)"
+    normalize_rules <"$LEGACY_RULES_FILE" | expand_system_rules | while IFS= read -r line; do echo "  - $line"; done
+  fi
+  echo "  # ----"
+  # 以域名进入的连接(fake-ip / 嗅探)前面的 no-resolve 规则不会匹配;
+  # 这里解析后再判断一次,内网域名才不会落到 MATCH
+  for c in $TAILNET_CIDRS; do
+    echo "  - IP-CIDR,$c,$TS_DIRECT"
+  done
+  for c in $LOCAL_CIDRS; do
+    echo "  - IP-CIDR,$c,DIRECT"
+  done
+  echo "  - MATCH,$FINAL_POLICY"
+}
+
+# render [--no-test]
+cmd_render() {
+  load_conf
+  check_conf
+  local ts_if tmp out
+  [ -f "$PROXIES_FILE" ] || die "未找到 $PROXIES_FILE"
+  grep -q CHANGE_ME "$PROXIES_FILE" && die "$PROXIES_FILE 里还有 CHANGE_ME,请先填写代理节点"
+  ts_if=$(ts_iface) || die "未找到 Tailscale 网卡,Tailscale 是否已连接?(也可在配置里设置 TS_IFACE)"
+
+  if [ "$PROXY_VIA_TAILSCALE" = yes ]; then
+    local s; s=$(first_server)
+    if [ -n "$s" ] && ! is_ipv4 "$s"; then
+      warn "代理节点 server 是域名($s),建议写 tailnet IP,避免解析/路由绕回物理网卡"
+    fi
+  fi
+
+  local k
+  for k in $(yaml_top_keys "$PROXIES_FILE"); do
+    case $k in proxies|rules|rule-providers) ;;
+      *) warn "$PROXIES_FILE 中的顶层键 $k 会被忽略(只支持 proxies / rules / rule-providers)" ;; esac
+  done
+  [ -n "$(yaml_section "$PROXIES_FILE" proxies | grep -v '^[[:space:]]*\(#.*\)\{0,1\}$')" ] \
+    || die "$PROXIES_FILE 中没有 proxies 节点"
+  local w
+  lint_rules | while IFS= read -r w; do warn "$w"; done
+  if [ "$OS" = linux ] && [ $EXIT_NODE = 1 ]; then
+    if [ -z "$TUN_RULE_INDEX" ] || [ $((TUN_RULE_INDEX + 10)) -ge 5270 ] || [ "$TUN_RULE_INDEX" -le 5250 ]; then
+      warn "本机在用 exit node,TUN_RULE_INDEX($TUN_RULE_INDEX) 应在 5251~5259 之间(建议 auto),否则公网流量进不了 TUN"
+    fi
+    [ "$FINAL_POLICY" = DIRECT ] && warn "本机在用 exit node,FINAL_POLICY=DIRECT 会让未命中规则的流量绕过 exit node(建议 auto)"
+  fi
+  if [ -f "$LEGACY_RULES_FILE" ]; then
+    warn "$LEGACY_RULES_FILE 已废弃,请把规则移到 $PROXIES_FILE 的 rules: 下并删除该文件"
+  fi
+
+  mkdir -p "$MIHOMO_DIR/providers" "$STATE_DIR"
+  # provider 文件里只放 proxies 部分
+  ( umask 077
+    { echo "proxies:"; yaml_section "$PROXIES_FILE" proxies; } >"$MIHOMO_DIR/providers/proxies.yaml" )
+  tmp=$MIHOMO_DIR/.config.yaml.$$
+  render_yaml "$ts_if" >"$tmp" || { rm -f "$tmp"; die "生成配置失败"; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$MIHOMO_DIR/config.yaml"
+  echo "$ts_if" >"$STATE_DIR/ts_iface"
+  echo "$EXIT_NODE" >"$STATE_DIR/exit_node"
+
+  if [ "${1:-}" != --no-test ]; then
+    if [ -x "$MIHOMO_BIN" ]; then
+      out=$("$MIHOMO_BIN" -t -d "$MIHOMO_DIR" 2>&1) || { echo "$out" >&2; die "mihomo 配置校验失败"; }
+      info "已生成并校验 $MIHOMO_DIR/config.yaml (Tailscale 网卡: $ts_if)"
+    else
+      warn "未找到 $MIHOMO_BIN,跳过校验(可执行: sudo $0 fetch-mihomo)"
+      info "已生成 $MIHOMO_DIR/config.yaml"
+    fi
+  fi
+}
+
+# 供 systemd / launchd 调用: 生成配置后 exec mihomo
+cmd_run() {
+  load_conf
+  [ -x "$MIHOMO_BIN" ] || die "未找到 $MIHOMO_BIN"
+  local i
+  # macOS 开机时 Tailscale 可能比本服务晚连上,稍等一会
+  for i in $(seq 1 30); do ts_iface >/dev/null && break; sleep 2; done
+  cmd_render --no-test
+  exec "$MIHOMO_BIN" -d "$MIHOMO_DIR"
+}
+
+# ---------------------------------------------------------------- 服务管理
+write_units() {
+  if [ "$OS" = linux ]; then
+    cat >/etc/systemd/system/$ROUTES_UNIT.service <<EOF
+[Unit]
+Description=mihomo-tun: tailnet via Tailscale, private/100.x via LAN
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# tailscaled 重启时一并重启本服务,重建规则和防火墙放行
+PartOf=tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN_PATH routes-up
+ExecStop=$BIN_PATH routes-down
+
+[Install]
+WantedBy=multi-user.target tailscaled.service
+EOF
+    cat >/etc/systemd/system/$MIHOMO_UNIT.service <<EOF
+[Unit]
+Description=mihomo-tun: mihomo TUN proxy
+After=network-online.target tailscaled.service $ROUTES_UNIT.service
+Wants=network-online.target $ROUTES_UNIT.service
+
+[Service]
+Type=simple
+ExecStart=$BIN_PATH run
+ExecStartPost=-$BIN_PATH dns-up
+ExecStopPost=-$BIN_PATH dns-down
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+  else
+    cat >$LAUNCHD_DIR/$ROUTES_LABEL.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$ROUTES_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN_PATH</string><string>routes-up</string></array>
+  <key>RunAtLoad</key><true/>
+  <!-- 网络变化(切换 Wi-Fi、Tailscale 重连)时重新检查,另外每 60 秒兜底检查一次 -->
+  <key>WatchPaths</key>
+  <array><string>/Library/Preferences/SystemConfiguration</string></array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/var/log/mihomo-tun-routes.log</string>
+  <key>StandardErrorPath</key><string>/var/log/mihomo-tun-routes.log</string>
+</dict>
+</plist>
+EOF
+    cat >$LAUNCHD_DIR/$MIHOMO_LABEL.plist <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$MIHOMO_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN_PATH</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>SoftResourceLimits</key>
+  <dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+  <key>StandardOutPath</key><string>/var/log/mihomo-tun.log</string>
+  <key>StandardErrorPath</key><string>/var/log/mihomo-tun.log</string>
+</dict>
+</plist>
+EOF
+    chown root:wheel $LAUNCHD_DIR/$ROUTES_LABEL.plist $LAUNCHD_DIR/$MIHOMO_LABEL.plist
+    chmod 0644 $LAUNCHD_DIR/$ROUTES_LABEL.plist $LAUNCHD_DIR/$MIHOMO_LABEL.plist
+  fi
+}
+
+# svc <start|stop|restart|status> <routes|mihomo>
+# start = 启动并开机自启; stop = 停止并取消开机自启
+svc() {
+  local act=$1 unit label
+  if [ "$2" = routes ]; then unit=$ROUTES_UNIT; label=$ROUTES_LABEL; else unit=$MIHOMO_UNIT; label=$MIHOMO_LABEL; fi
+  if [ "$OS" = linux ]; then
+    case $act in
+      start)   systemctl enable --now "$unit.service" ;;
+      stop)    systemctl disable --now "$unit.service" 2>/dev/null ;;
+      restart) systemctl restart "$unit.service" ;;
+      status)  systemctl --no-pager status "$unit.service" 2>/dev/null | head -5 ;;
+    esac
+  else
+    case $act in
+      start)
+        launchctl enable "system/$label"
+        launchctl bootstrap system "$LAUNCHD_DIR/$label.plist" 2>/dev/null \
+          || launchctl kickstart -k "system/$label" ;;
+      stop)
+        launchctl bootout "system/$label" 2>/dev/null
+        launchctl disable "system/$label" ;;
+      restart)
+        launchctl kickstart -k "system/$label" 2>/dev/null || svc start "$2" ;;
+      status)
+        if launchctl print "system/$label" >/dev/null 2>&1; then
+          launchctl print "system/$label" | awk -v l="$label" '
+            /^\tstate =/ || /^\tpid =/ || /^\tlast exit code =/ { sub(/^\t/, ""); s = s "  " $0 }
+            END { print l ":" s }'
+        else
+          echo "$label: 未运行"
+        fi ;;
+    esac
+  fi
+}
+
+which_parts() {  # 未指定时默认两者
+  case "${1:-}" in
+    routes) echo routes ;;
+    mihomo) echo mihomo ;;
+    ""|all) echo routes mihomo ;;
+    *) die "未知的服务: $1 (可选 routes|mihomo)" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- 命令
+# install [--nss-resolve | --no-nss-resolve]
+cmd_install() {
+  need_root install
+  local f nss=ask a
+  for a in "$@"; do
+    case $a in
+      --nss-resolve)    nss=yes ;;
+      --no-nss-resolve) nss=no ;;
+      *) die "未知参数: $a (可选 --nss-resolve --no-nss-resolve)" ;;
+    esac
+  done
+
+  # 1) 安装脚本本身
+  mkdir -p "$(dirname "$BIN_PATH")"
+  if [ "$SELF" != "$BIN_PATH" ]; then install -m 0755 "$SELF" "$BIN_PATH"; fi
+
+  # 2) 配置文件(已存在则不覆盖)
+  mkdir -p "$CONF_DIR"; chmod 0755 "$CONF_DIR"
+  # 优先用仓库 conf/ 下已编辑好的文件,其次用 .example
+  local src
+  for f in mihomo-tun.conf proxies.yaml; do
+    [ -f "$CONF_DIR/$f" ] && continue
+    src=""
+    if [ -f "$SELF_DIR/conf/$f" ]; then src=$SELF_DIR/conf/$f
+    elif [ -f "$SELF_DIR/conf/$f.example" ]; then src=$SELF_DIR/conf/$f.example; fi
+    [ -n "$src" ] || continue
+    install -m 0600 "$src" "$CONF_DIR/$f"
+    info "已创建 $CONF_DIR/$f (来自 $src)"
+  done
+  load_conf
+
+  # 3) 系统相关
+  if [ "$OS" = linux ]; then
+    # 旧版(ts-policy-routing)迁移
+    if [ -f /etc/systemd/system/ts-policy-routing.service ]; then
+      info "停用旧的 ts-policy-routing.service"
+      systemctl disable --now ts-policy-routing.service 2>/dev/null
+      rm -f /etc/systemd/system/ts-policy-routing.service /usr/local/sbin/ts-policy-routing.sh
+    fi
+    if [ -f /etc/systemd/system/mihomo.service ] && grep -Eq '^tun:' /etc/mihomo/config.yaml 2>/dev/null \
+       && grep -A1 -E '^tun:' /etc/mihomo/config.yaml | grep -q 'enable: *true'; then
+      warn "检测到旧的 mihomo.service 也开启了 TUN,会与本服务冲突,请手动停用: sudo systemctl disable --now mihomo"
+    fi
+    # systemd-networkd 默认会清掉外部添加的策略路由(需 systemd >= 249)
+    if systemctl is-active --quiet systemd-networkd; then
+      mkdir -p /etc/systemd/networkd.conf.d
+      cat >/etc/systemd/networkd.conf.d/10-mihomo-tun.conf <<'EOF'
+# 由 mihomo-tun 安装:防止 systemd-networkd 清掉 Tailscale / mihomo / mihomo-tun 添加的策略路由和路由
+[Network]
+ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
+EOF
+      systemctl restart systemd-networkd
+    fi
+  fi
+  write_units
+  [ "$nss" = no ] || ensure_nss_resolve "$nss"
+
+  # 4) 有配置就先把策略路由跑起来;mihomo 等用户填好节点后再 start
+  if [ -n "$TAILNET_CIDRS" ]; then
+    svc start routes
+  fi
+  if [ "$OS" = darwin ]; then
+    launchctl disable "system/$MIHOMO_LABEL" 2>/dev/null   # 防止开机时带着示例配置自启
+  fi
+
+  cat >&2 <<EOF
+
+[mihomo-tun] 安装完成。接下来:
+  1. 编辑 $CONF_FILE   (TAILNET_CIDRS 等网络参数)
+  2. 编辑 $PROXIES_FILE   (代理节点 proxies + 分流规则 rules)
+  3. 没有 mihomo 时: sudo mihomo-tun fetch-mihomo
+  4. sudo mihomo-tun start && mihomo-tun verify
+EOF
+}
+
+confirm() {  # confirm <提示>;非交互终端下视为拒绝
+  local ans
+  [ -t 0 ] || return 1
+  printf '%s [y/N] ' "$1" >&2
+  read -r ans
+  case $ans in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+rm_v() {  # 删除并打印
+  local f
+  for f in "$@"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    rm -rf "$f" && info "已删除 $f"
+  done
+}
+
+# uninstall [--purge] [--remove-mihomo] [--all] [-y]
+cmd_uninstall() {
+  need_root uninstall
+  local purge=0 rm_mihomo=0 yes=0 a
+  for a in "$@"; do
+    case $a in
+      --purge)         purge=1 ;;
+      --remove-mihomo) rm_mihomo=1 ;;
+      --all)           purge=1; rm_mihomo=1 ;;
+      -y|--yes)        yes=1 ;;
+      *) die "未知参数: $a (可选 --purge --remove-mihomo --all -y)" ;;
+    esac
+  done
+  load_conf
+
+  if [ $purge = 1 ] && [ $yes = 0 ] && [ -d "$CONF_DIR" ]; then
+    confirm "将删除配置目录 $CONF_DIR(包含代理节点密码),确定?" \
+      || die "已取消(非交互执行时请加 -y)"
+  fi
+
+  # 1) 停服务:先停 mihomo(其退出时会自行清理 TUN 和自己的路由),再撤策略路由
+  info "停止服务"
+  svc stop mihomo
+  svc stop routes
+  cmd_routes_down        # 服务没装或已失效时也确保规则被删掉
+
+  # 2) 删除服务定义
+  if [ "$OS" = linux ]; then
+    rm_v /etc/systemd/system/$ROUTES_UNIT.service /etc/systemd/system/$MIHOMO_UNIT.service
+    systemctl daemon-reload
+    systemctl reset-failed "$ROUTES_UNIT.service" "$MIHOMO_UNIT.service" 2>/dev/null
+    if [ -f /etc/systemd/networkd.conf.d/10-mihomo-tun.conf ]; then
+      rm_v /etc/systemd/networkd.conf.d/10-mihomo-tun.conf
+      rmdir /etc/systemd/networkd.conf.d 2>/dev/null
+      # 不立即重启 networkd:重启后它会按默认行为清理 Tailscale 等添加的外部策略路由
+      warn "已删除 networkd 配置,下次重启 systemd-networkd(或重启系统)后恢复默认行为"
+    fi
+    # 旧版残留
+    if [ -f /etc/systemd/system/ts-policy-routing.service ]; then
+      systemctl disable --now ts-policy-routing.service 2>/dev/null
+      rm_v /etc/systemd/system/ts-policy-routing.service
+      systemctl daemon-reload
+    fi
+    rm_v /usr/local/sbin/ts-policy-routing.sh
+  else
+    rm_v $LAUNCHD_DIR/$ROUTES_LABEL.plist $LAUNCHD_DIR/$MIHOMO_LABEL.plist
+    rm_v /var/log/mihomo-tun.log /var/log/mihomo-tun-routes.log
+  fi
+
+  revert_nss_resolve
+  systemctl stop "$ROLLBACK_UNIT.timer" 2>/dev/null
+
+  # 3) 脚本、运行时状态
+  rm_v "$STATE_DIR"
+  rm_v "$BIN_PATH"
+
+  # 4) 可选: 配置目录、mihomo 二进制
+  if [ $purge = 1 ]; then
+    rm_v "$CONF_DIR"
+    # MIHOMO_DIR 被改到配置目录之外时也一并删除
+    case $MIHOMO_DIR in "$CONF_DIR"/*) ;; *) rm_v "$MIHOMO_DIR" ;; esac
+  else
+    info "配置保留在 $CONF_DIR(--purge 可一并删除)"
+  fi
+  if [ $rm_mihomo = 1 ]; then
+    rm_v "$MIHOMO_BIN"
+  elif [ -e "$MIHOMO_BIN" ]; then
+    info "mihomo 二进制保留在 $MIHOMO_BIN(--remove-mihomo 可一并删除)"
+  fi
+
+  # 5) 检查残留
+  local left=""
+  if [ "$OS" = linux ]; then
+    left=$(ip -4 rule | awk -F: -v lo="$RULE_PRIORITY_BASE" '$1 >= lo && $1 < lo + 20')
+    ip link show "$TUN_DEVICE" >/dev/null 2>&1 && left="$left
+TUN 设备 $TUN_DEVICE 仍存在"
+  else
+    ifconfig "$TUN_DEVICE" >/dev/null 2>&1 && left="TUN 设备 $TUN_DEVICE 仍存在"
+  fi
+  if [ -n "$left" ]; then
+    warn "仍有残留,请手动检查:"; echo "$left" >&2
+  else
+    info "卸载完成"
+  fi
+}
+
+# ---------------------------------------------------------------- 分流 DNS
+# 系统 DNS 通常是被排除的内网地址,mihomo 拿不到查询,域名规则只能靠 sniffer,
+# 而且本地解析不了的域名(只在代理端可解析)根本连不上。
+# 这里把规则里的域名交给 mihomo(经 TUN 的 dns-hijack 得到 fake-ip):
+#   Linux: systemd-resolved 在 TUN 网卡上设置路由域 ~domain
+#   macOS: /etc/resolver/<domain>
+split_dns_domains() {
+  if [ -n "$SPLIT_DNS_DOMAINS" ]; then echo $SPLIT_DNS_DOMAINS; return; fi
+  [ -f "$PROXIES_FILE" ] || return 0
+  # 取 DOMAIN / DOMAIN-SUFFIX 且策略不是 DIRECT / TAILSCALE 的规则
+  yaml_section "$PROXIES_FILE" rules | normalize_rules \
+    | awk -F, -v ts="$TS_DIRECT" -v sys="$SYSTEM_POLICY" '($1 == "DOMAIN-SUFFIX" || $1 == "DOMAIN") && $3 != "DIRECT" && $3 != ts && $3 != sys { print $2 }' \
+    | sort -u
+}
+
+RESOLVER_MARK="# mihomo-tun"
+
+# Linux: 程序要经过 systemd-resolved 解析,分流 DNS 才生效
+# (resolv.conf 指向 127.0.0.53,或 nsswitch 的 hosts 里有 resolve)
+split_dns_reachable() {
+  [ "$OS" = linux ] || return 0
+  grep -Eq '^nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf 2>/dev/null && return 0
+  grep -Eq '^hosts:.*[[:space:]]resolve' /etc/nsswitch.conf 2>/dev/null && return 0
+  return 1
+}
+NSS_BACKUP=/etc/nsswitch.conf.mihomo-tun.bak   # 存在即表示 nsswitch 是本脚本改的
+NSS_ENTRY='resolve [!UNAVAIL=return]'
+
+# ensure_nss_resolve ask|yes: 让 glibc 经 systemd-resolved 解析(分流 DNS / MagicDNS 依赖它)
+ensure_nss_resolve() {
+  [ "$OS" = linux ] || return 0
+  [ "$SPLIT_DNS" = yes ] || [ "$MAGICDNS_LINK" != no ] || return 0
+  systemctl is-active --quiet systemd-resolved || return 0
+  split_dns_reachable && return 0
+  if ! have apt-get; then warn "$SPLIT_DNS_HINT"; return 0; fi
+  if [ "$1" = ask ] && ! confirm "分流 DNS / MagicDNS 需要安装 libnss-resolve 并修改 /etc/nsswitch.conf,现在安装?"; then
+    warn "$SPLIT_DNS_HINT(之后可执行: sudo mihomo-tun install --nss-resolve)"; return 0
+  fi
+  [ -f "$NSS_BACKUP" ] || cp -p /etc/nsswitch.conf "$NSS_BACKUP"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y libnss-resolve >/dev/null || { warn "安装 libnss-resolve 失败"; return 1; }
+  # 包的安装脚本通常会改好 nsswitch;没改的话手动在 dns 前插入
+  if ! split_dns_reachable; then
+    sed -i -E "/^hosts:/ s/([[:space:]])dns([[:space:]]|\$)/\1$NSS_ENTRY dns\2/" /etc/nsswitch.conf
+  fi
+  split_dns_reachable && info "已启用 libnss-resolve: $(grep '^hosts:' /etc/nsswitch.conf)(备份 $NSS_BACKUP)"
+}
+
+revert_nss_resolve() {
+  [ "$OS" = linux ] && [ -f "$NSS_BACKUP" ] || return 0
+  sed -i -E "/^hosts:/ s/[[:space:]]*resolve[[:space:]]+\[!UNAVAIL=return\]//" /etc/nsswitch.conf
+  rm -f "$NSS_BACKUP"
+  info "已从 /etc/nsswitch.conf 去掉 resolve: $(grep '^hosts:' /etc/nsswitch.conf)(libnss-resolve 包保留)"
+}
+
+SPLIT_DNS_HINT="程序解析域名不经过 systemd-resolved,分流 DNS 不会生效。可安装 libnss-resolve(会在 /etc/nsswitch.conf 的 hosts 中加入 resolve)"
+
+cmd_dns_up() {
+  need_root dns-up
+  load_conf
+  [ "$SPLIT_DNS" = yes ] || return 0
+  local doms d i
+  doms=$(split_dns_domains)
+  [ -n "$doms" ] || return 0
+  if [ "$OS" = linux ]; then
+    if ! have resolvectl || ! systemctl is-active --quiet systemd-resolved; then
+      warn "systemd-resolved 未运行,跳过分流 DNS"; return 0
+    fi
+    for i in $(seq 1 30); do ip link show "$TUN_DEVICE" >/dev/null 2>&1 && break; sleep 0.5; done
+    ip link show "$TUN_DEVICE" >/dev/null 2>&1 || { warn "TUN 网卡 $TUN_DEVICE 不存在,跳过分流 DNS"; return 1; }
+    set --
+    for d in $doms; do set -- "$@" "~$d"; done
+    resolvectl dns "$TUN_DEVICE" "$TUN_DNS" \
+      && resolvectl domain "$TUN_DEVICE" "$@" \
+      && resolvectl default-route "$TUN_DEVICE" false \
+      || { warn "设置 systemd-resolved 失败"; return 1; }
+    resolvectl flush-caches 2>/dev/null
+  else
+    mkdir -p /etc/resolver
+    cmd_dns_down_mac
+    for d in $doms; do
+      printf '%s\nnameserver %s\n' "$RESOLVER_MARK" "$TUN_DNS" >"/etc/resolver/$d"
+    done
+    dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null
+  fi
+  info "分流 DNS -> mihomo: $(echo $doms)"
+  split_dns_reachable || warn "$SPLIT_DNS_HINT"
+}
+
+cmd_dns_down_mac() {
+  local f
+  for f in $(find /etc/resolver -type f 2>/dev/null); do
+    head -1 "$f" | grep -qx "$RESOLVER_MARK" && rm -f "$f"
+  done
+}
+
+cmd_dns_down() {
+  need_root dns-down
+  load_conf
+  if [ "$OS" = linux ]; then
+    have resolvectl && ip link show "$TUN_DEVICE" >/dev/null 2>&1 && resolvectl revert "$TUN_DEVICE" 2>/dev/null
+    have resolvectl && resolvectl flush-caches 2>/dev/null
+  else
+    cmd_dns_down_mac
+    dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null
+  fi
+  return 0
+}
+
+cmd_routes_up() {
+  need_root routes-up
+  load_conf; check_conf
+  mkdir -p "$STATE_DIR"
+  if [ "$OS" = linux ]; then linux_routes_up; else mac_routes_up; fi
+}
+
+cmd_routes_down() {
+  need_root routes-down
+  load_conf
+  if [ "$OS" = linux ]; then linux_routes_down; else mac_routes_down; fi
+}
+
+ROLLBACK_UNIT=mihomo-tun-rollback
+
+# 解析 start/restart 的参数: [routes|mihomo] [--rollback 分钟]
+parse_svc_args() {
+  SVC_PART=""; SVC_ROLLBACK=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --rollback) SVC_ROLLBACK=${2:-}; shift
+                  case $SVC_ROLLBACK in ''|*[!0-9]*) die "--rollback 需要分钟数" ;; esac ;;
+      *) SVC_PART=$1 ;;
+    esac
+    shift
+  done
+}
+
+# 远程操作时防止网络改坏后失联: N 分钟后自动执行 mihomo-tun stop,确认正常后用 confirm 取消
+arm_rollback() {
+  [ -n "$1" ] || return 0
+  [ "$OS" = linux ] || { warn "--rollback 目前只支持 Linux"; return 0; }
+  systemctl stop "$ROLLBACK_UNIT.timer" 2>/dev/null
+  systemctl reset-failed "$ROLLBACK_UNIT.service" 2>/dev/null
+  systemd-run --quiet --on-active="${1}min" --unit="$ROLLBACK_UNIT" "$BIN_PATH" stop \
+    || die "设置自动回滚失败"
+  info "已设置 $1 分钟后自动回滚(mihomo-tun stop)。确认一切正常后执行: sudo mihomo-tun confirm"
+}
+
+cmd_confirm() {
+  need_root confirm
+  if systemctl is-active --quiet "$ROLLBACK_UNIT.timer" 2>/dev/null; then
+    systemctl stop "$ROLLBACK_UNIT.timer" && info "已取消自动回滚"
+  else
+    info "没有待执行的自动回滚"
+  fi
+}
+
+cmd_start() {
+  need_root start
+  local p
+  parse_svc_args "$@"
+  load_conf; check_conf
+  [ "$(which_parts "$SVC_PART")" ] && arm_rollback "$SVC_ROLLBACK"
+  for p in $(which_parts "$SVC_PART"); do
+    [ "$p" = mihomo ] && cmd_render       # 先校验,配置错了不启动
+    svc start "$p"
+    [ "$p" = mihomo ] && [ "$OS" = darwin ] && cmd_dns_up
+  done
+}
+
+cmd_stop() {
+  need_root stop
+  local p parts
+  parts=$(which_parts "${1:-}")
+  # 先停 mihomo 再撤路由
+  for p in mihomo routes; do
+    case " $parts " in *" $p "*) svc stop "$p" ;; esac
+  done
+  case " $parts " in *" mihomo "*) [ "$OS" = darwin ] && cmd_dns_down ;; esac
+  case " $parts " in *" routes "*) cmd_routes_down ;; esac
+}
+
+cmd_restart() {
+  need_root restart
+  local p
+  parse_svc_args "$@"
+  load_conf; check_conf
+  [ "$(which_parts "$SVC_PART")" ] && arm_rollback "$SVC_ROLLBACK"
+  for p in $(which_parts "$SVC_PART"); do
+    if [ "$p" = routes ]; then
+      cmd_routes_down; svc restart routes
+    else
+      cmd_render; svc restart mihomo
+      [ "$OS" = darwin ] && cmd_dns_up
+    fi
+  done
+}
+
+cmd_status() {
+  load_conf
+  local ts_if
+  echo "== 服务 =="
+  svc status routes
+  svc status mihomo
+  echo
+  echo "== Tailscale 网卡 =="
+  ts_if=$(ts_iface) && echo "$ts_if" || echo "未找到"
+  echo
+  echo "== 路由 =="
+  if [ "$OS" = linux ]; then linux_routes_show; else mac_routes_show; fi
+}
+
+route_dev() {
+  if [ "$OS" = linux ]; then
+    ip -4 route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1
+  else
+    route -n get "$1" 2>/dev/null | awk '/interface:/{print $2; exit}'
+  fi
+}
+
+cmd_verify() {
+  if [ -f "$CONF_FILE" ] && [ ! -r "$CONF_FILE" ]; then die "无法读取 $CONF_FILE,请用 sudo 运行"; fi
+  load_conf
+  local ts_if proxy_ip fail=0 mihomo_up=0
+  ts_if=$(ts_iface) || ts_if="?"
+  proxy_ip=${VERIFY_PROXY_IP:-$(first_server)}
+  [ -n "$proxy_ip" ] && is_ipv4 "$proxy_ip" || proxy_ip=""
+  ifconfig "$TUN_DEVICE" >/dev/null 2>&1 || ip link show "$TUN_DEVICE" >/dev/null 2>&1 && mihomo_up=1
+
+  check() {  # check <IP> ts|lan|tun <说明>
+    local got ok=0
+    got=$(route_dev "$1")
+    case $2 in
+      ts)  [ "$got" = "$ts_if" ] && ok=1 ;;
+      lan) [ -n "$got" ] && [ "$got" != "$ts_if" ] && [ "$got" != "$TUN_DEVICE" ] && ok=1 ;;
+      tun) [ "$got" = "$TUN_DEVICE" ] && ok=1 ;;
+    esac
+    [ $ok = 1 ] || fail=1
+    printf '%-4s %-18s -> %-12s (%s)\n' "$([ $ok = 1 ] && echo OK || echo FAIL)" "$1" "${got:-?}" "$3"
+  }
+
+  echo "== exit node =="
+  if [ $EXIT_NODE = 1 ]; then echo "在用 (TUN_RULE_INDEX=${TUN_RULE_INDEX:-默认}, FINAL_POLICY=$FINAL_POLICY)"
+  else echo "未用 (FINAL_POLICY=$FINAL_POLICY)"; fi
+  if [ -f "$STATE_DIR/exit_node" ] && [ "$(cat "$STATE_DIR/exit_node")" != "$EXIT_NODE" ]; then
+    fail=1; echo "FAIL exit node 状态在 mihomo 启动后变了,请执行: sudo mihomo-tun restart"
+  fi
+  echo
+  echo "== 路由走向 (Tailscale: $ts_if, TUN: $TUN_DEVICE) =="
+  [ -n "$proxy_ip" ] && check "$proxy_ip" ts "代理节点"
+  local c
+  for c in $TAILNET_CIDRS; do
+    check "${c%/*}" ts "tailnet $c"
+  done
+  if [ -n "$MAGICDNS_IP" ] && [ -f "$STATE_DIR/magicdns" ] && [ "$(route_dev "$MAGICDNS_IP")" != "$ts_if" ]; then
+    # resolved 在 tailscale0 上发查询时绑定网卡,不受路由表影响,只做提示
+    printf '%-4s %-18s -> %-12s (%s)\n' WARN "$MAGICDNS_IP" "$(route_dev "$MAGICDNS_IP")" "MagicDNS: 未绑定网卡的程序直接访问会失败,系统解析不受影响"
+    ip -4 rule | awk -F: -v lo="$RULE_PRIORITY_BASE" '$1 > 0 && $1 < lo { print "       更靠前的规则: " $0 }'
+  elif [ -n "$MAGICDNS_IP" ]; then
+    check "$MAGICDNS_IP" ts "MagicDNS"
+    if [ "$OS" = linux ] && [ "$(route_dev "$MAGICDNS_IP")" != "$ts_if" ]; then
+      echo "     有比 $RULE_PRIORITY_BASE 更靠前的规则覆盖了它(绑定 $ts_if 的 socket,如 resolved / mihomo 的 TAILSCALE 出口,不受影响):"
+      ip -4 rule | awk -F: -v lo="$RULE_PRIORITY_BASE" '$1 > 0 && $1 < lo { print "       " $0 }'
+    fi
+  fi
+
+  local probe
+  for probe in 100.99.0.5 10.1.2.3 172.20.0.1 $VERIFY_LAN_IP; do
+    local skip=0 in_local=0
+    for c in $TAILNET_CIDRS; do in_cidr "$probe" "$c" && skip=1; done
+    for c in $LOCAL_CIDRS; do in_cidr "$probe" "$c" && in_local=1; done
+    [ $skip = 0 ] && [ $in_local = 1 ] && check "$probe" lan "本地网段"
+  done
+
+  if [ $mihomo_up = 1 ]; then
+    check 8.8.8.8 tun "公网 -> mihomo TUN"
+  else
+    echo "--   8.8.8.8            (mihomo TUN 未启动,跳过)"
+  fi
+
+  local doms d got
+  if [ "$OS" = linux ] && [ -n "$MAGICDNS_IP" ] && [ -f "$STATE_DIR/magicdns" ]; then
+    local self peer
+    echo
+    echo "== MagicDNS (系统解析 tailnet 节点) =="
+    self=$(ts_cli status --json 2>/dev/null | sed -n 's/.*"DNSName": *"\([^"]*\)\.".*/\1/p' | head -1)
+    peer=$(ts_cli status 2>/dev/null | awk '$1 ~ /^100\./ && NR > 1 { print $2; exit }')
+    for d in $self ${self%%.*} $peer; do
+      got=$(timeout 8 getent ahostsv4 "$d" 2>/dev/null | awk 'NR == 1 { print $1 }')
+      if [ -n "$got" ] && in_cidr "$got" 100.64.0.0/10; then
+        printf 'OK   %-34s -> %s\n' "$d" "$got"
+      else
+        fail=1; printf 'FAIL %-34s -> %s\n' "$d" "${got:-解析失败}"
+      fi
+    done
+  fi
+
+  doms=$(split_dns_domains)
+  if [ $mihomo_up = 1 ] && [ "$SPLIT_DNS" = yes ] && [ -n "$doms" ]; then
+    echo
+    echo "== 分流 DNS (应解析为 fake-ip $FAKE_IP_RANGE) =="
+    split_dns_reachable || echo "警告: $SPLIT_DNS_HINT"
+    for d in $doms; do
+      got=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR == 1 { print $1 }')
+      if [ -n "$got" ] && in_cidr "$got" "$FAKE_IP_RANGE"; then
+        printf 'OK   %-24s -> %s\n' "$d" "$got"
+      else
+        fail=1; printf 'FAIL %-24s -> %s\n' "$d" "${got:-解析失败}"
+      fi
+    done
+  fi
+
+  if [ $mihomo_up = 1 ] && have curl; then
+    echo
+    echo "== 代理连通性 (经 mixed-port $MIXED_PORT) =="
+    local code
+    code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' -x "http://127.0.0.1:$MIXED_PORT" "$HEALTH_CHECK_URL")
+    echo "$HEALTH_CHECK_URL -> HTTP $code (走哪个出口取决于 rules)"
+  fi
+
+  echo
+  echo "== 代理流量是否误走物理网卡(访问被代理网站时,应无输出) =="
+  local phy
+  if [ "$OS" = darwin ]; then set -- $(mac_default_gw); phy=${2:-en0}
+  else phy=$(ip -4 route show default table main 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1); fi
+  echo "sudo tcpdump -ni ${phy:-<物理网卡>} host ${proxy_ip:-<代理节点IP>}"
+  return $fail
+}
+
+cmd_fetch_mihomo() {
+  need_root fetch-mihomo
+  load_conf
+  have curl || die "需要 curl"
+  local arch ver api json url tmp name
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    armv7*)        arch=armv7 ;;
+    *) die "不支持的架构: $(uname -m)" ;;
+  esac
+  ver=${1:-}
+  if [ -n "$ver" ]; then api=https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/$ver
+  else api=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest; fi
+  json=$(curl -fsSL "$api") || die "获取版本信息失败: $api"
+  ver=$(echo "$json" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+  for name in "mihomo-$OS-$arch-$ver.gz" "mihomo-$OS-$arch-compatible-$ver.gz" "mihomo-$OS-$arch-v1-$ver.gz"; do
+    url=$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*/$name\"" | cut -d'"' -f4)
+    [ -n "$url" ] && break
+  done
+  [ -n "$url" ] || die "在 $ver 中没找到 $OS-$arch 的二进制"
+  info "下载 $url"
+  tmp=$(mktemp -d)
+  curl -fL --progress-bar -o "$tmp/mihomo.gz" "${MIHOMO_DOWNLOAD_PREFIX:-}$url" || { rm -rf "$tmp"; die "下载失败"; }
+  gunzip "$tmp/mihomo.gz" || { rm -rf "$tmp"; die "解压失败"; }
+  mkdir -p "$(dirname "$MIHOMO_BIN")"
+  install -m 0755 "$tmp/mihomo" "$MIHOMO_BIN"
+  rm -rf "$tmp"
+  "$MIHOMO_BIN" -v
+}
+
+usage() {
+  cat <<EOF
+mihomo-tun $VERSION — Tailscale 网络下的 mihomo TUN 全局代理 ($OS)
+
+用法: mihomo-tun <命令> [参数]
+
+  install [选项]          安装脚本、示例配置和系统服务(可重复执行,不覆盖已有配置)
+                            --nss-resolve     需要时直接安装 libnss-resolve(默认询问)
+                            --no-nss-resolve  不安装
+  uninstall [选项]        停止并删除服务、路由规则和脚本(默认保留配置和 mihomo)
+                            --purge          同时删除配置目录
+                            --remove-mihomo  同时删除 mihomo 二进制
+                            --all            等于 --purge --remove-mihomo
+                            -y               不再确认
+  start   [routes|mihomo] [--rollback 分钟]   启动并设为开机自启(默认两者)
+  stop    [routes|mihomo]                   停止并取消开机自启
+  restart [routes|mihomo] [--rollback 分钟]   重新生成配置并重启
+                          --rollback N: N 分钟后自动 stop,远程操作时防止失联
+  confirm                 确认正常,取消自动回滚
+  status                  服务状态、Tailscale 网卡、路由
+  verify                  检查各网段的实际路由走向
+  render                  只生成并校验 mihomo 配置
+  routes-up | routes-down 手动添加 / 删除路由规则
+  dns-up | dns-down       手动设置 / 撤销分流 DNS
+  fetch-mihomo [版本]     从 GitHub 下载 mihomo 到 MIHOMO_BIN(默认最新版)
+  run                     (供服务调用)生成配置并以前台方式运行 mihomo
+
+配置目录: $CONF_DIR  (可用环境变量 MIHOMO_TUN_CONF_DIR 覆盖)
+  mihomo-tun.conf   网络参数
+  proxies.yaml      代理节点(proxies)与分流规则(rules)
+EOF
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  install)      cmd_install "$@" ;;
+  uninstall)    cmd_uninstall "$@" ;;
+  start)        cmd_start "$@" ;;
+  stop)         cmd_stop "$@" ;;
+  restart)      cmd_restart "$@" ;;
+  status)       cmd_status ;;
+  verify)       cmd_verify ;;
+  render)       need_root render; cmd_render "$@" ;;
+  run)          cmd_run ;;
+  confirm)      cmd_confirm ;;
+  routes-up)    cmd_routes_up ;;
+  routes-down)  cmd_routes_down ;;
+  dns-up)       cmd_dns_up ;;
+  dns-down)     cmd_dns_down ;;
+  fetch-mihomo) cmd_fetch_mihomo "$@" ;;
+  version|-v|--version) echo "mihomo-tun $VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

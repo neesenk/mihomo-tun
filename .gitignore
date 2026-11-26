@@ -1,0 +1,3 @@
+# 本机实际配置,含代理密码和 API secret
+conf/mihomo-tun.conf
+conf/proxies.yaml

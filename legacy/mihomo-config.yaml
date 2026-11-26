@@ -1,0 +1,63 @@
+mixed-port: 7890
+mode: rule
+log-level: info
+ipv6: false
+
+tun:
+  enable: true
+  stack: mixed
+  device: mihomo-tun
+  inet4-address:                 # 新版本也可写 address: [172.19.0.1/30]
+    - 172.19.0.1/30
+  mtu: 1400
+  auto-route: true               # 不要开 auto-redirect,避免和 Tailscale 的 netfilter 规则干扰
+  auto-detect-interface: true
+  strict-route: false
+  dns-hijack:
+    - any:53
+  route-exclude-address:         # 这些网段不进 TUN
+    - 100.0.0.0/8
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+    - 172.16.0.0/12
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.ts.net"
+  nameserver:
+    - 223.5.5.5
+  nameserver-policy:
+    "+.ts.net": 100.100.100.100
+  proxy-server-nameserver:
+    - 223.5.5.5
+
+# 服务器本机的 DNS 请求若发往被排除的内网 DNS,不会经过 mihomo,
+# 此时域名规则依赖 sniffer 从 TLS SNI / HTTP Host 还原域名
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  sniff:
+    TLS:  { ports: [443] }
+    HTTP: { ports: [80] }
+
+proxies:
+  - name: proxy
+    type: ss                     # TODO: 换成你实际的协议
+    server: 100.81.1.10          # TODO: 代理节点的 tailnet IP,不要写域名
+    port: 8388                   # TODO
+    cipher: aes-128-gcm          # TODO
+    password: "CHANGE_ME"        # TODO
+    interface-name: tailscale0   # 关键: 连接代理服务器的 socket 绑定 tailscale0,避免被绑到物理网卡
+
+rules:
+  - IP-CIDR,100.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,example.com,proxy    # TODO: 换成需要代理的网站
+  - DOMAIN-SUFFIX,example.org,proxy
+  - MATCH,DIRECT

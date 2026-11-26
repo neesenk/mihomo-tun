@@ -1,0 +1,15 @@
+[Unit]
+Description=Policy routing: tailnet via Tailscale, private/100.x via LAN
+After=network-online.target tailscaled.service
+Wants=network-online.target
+# tailscaled 重启时一并重启本服务,规则和防火墙放行会被重建
+PartOf=tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ts-policy-routing.sh start
+ExecStop=/usr/local/sbin/ts-policy-routing.sh stop
+
+[Install]
+WantedBy=multi-user.target
