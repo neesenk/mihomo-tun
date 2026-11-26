@@ -19,6 +19,7 @@ sudo ./mihomo-tun install          # 安装到 /usr/local/bin,生成示例配置
 sudo vi /etc/mihomo-tun/mihomo-tun.conf   # macOS: /usr/local/etc/mihomo-tun/
 sudo vi /etc/mihomo-tun/proxies.yaml
 sudo mihomo-tun fetch-mihomo       # 没有 mihomo 时
+sudo mihomo-tun update             # 升级 mihomo(可指定版本,--force 强制重装),失败自动换回旧版本
 sudo mihomo-tun start --rollback 10   # 远程机器上建议加:10 分钟后自动 stop,防止改坏网络后失联
 sudo mihomo-tun verify
 sudo mihomo-tun confirm               # 确认正常后取消自动回滚
@@ -122,3 +123,26 @@ resolv.conf。
 `sudo systemctl disable --now mihomo`。
 旧版独立的 `rules.txt` 仍会被读取(带警告),建议把内容移到 `proxies.yaml` 的 `rules:` 下后删除。
 旧的 `/etc/default/ts-policy-routing` 里的 `LAN_IFACE` 要手动搬到 `mihomo-tun.conf`。
+
+## Windows 11(实验性)
+
+`windows/mihomo-tun.ps1` 是 PowerShell 版骨架，配置文件格式相同，尚未在真机上验证（代码里标了 `TODO(win)`）。
+
+```powershell
+# 管理员 PowerShell
+powershell -ExecutionPolicy Bypass -File .\windows\mihomo-tun.ps1 install
+notepad C:\ProgramData\mihomo-tun\mihomo-tun.conf
+notepad C:\ProgramData\mihomo-tun\proxies.yaml
+mihomo-tun fetch-mihomo            # 以后升级: mihomo-tun update
+mihomo-tun start --rollback 10
+mihomo-tun verify
+mihomo-tun confirm
+```
+
+与 macOS 版的对应关系：
+- 路由：同样用"更长前缀"覆盖 Tailscale 的 `100.64.0.0/10`（`New-NetRoute -PolicyStore ActiveStore`，不持久化，开机由任务重建）
+- 服务：计划任务 `\mihomo-tun\routes`（开机、网络变化、每分钟执行 `routes-up`）和 `\mihomo-tun\mihomo`（开机执行 `run`，循环运行 mihomo）
+- 分流 DNS / MagicDNS：NRPT 规则（`Get-DnsClientNrptRule`，Comment 为 `mihomo-tun*`）。mihomo 退出时会删除；异常退出时由 routes 任务兜底清理
+- TUN：mihomo 的 wintun 网卡，默认名 `mihomo-tun`
+
+已知风险：Tailscale 重新配置时可能删掉它网卡上的 tailnet 路由（最多 1 分钟后由 routes 任务补回）；IPv6 和 Smart Multi-Homed Name Resolution 需要手动处理，`verify` 会提示。
