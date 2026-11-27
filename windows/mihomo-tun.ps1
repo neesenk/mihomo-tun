@@ -110,7 +110,8 @@ function Read-Conf {
 
   $script:TsPrefs = Get-TsPrefs
   $script:ExitNode = [bool]($script:TsPrefs -and $script:TsPrefs.ExitNodeID)
-  if ($c.FINAL_POLICY -eq 'auto') { $c.FINAL_POLICY = if ($script:ExitNode) { $TS_DIRECT } else { 'DIRECT' } }
+  # Windows 同 macOS:未命中规则的流量从本机物理网卡出网(auto-detect-interface),与 exit node 开关无关
+  if ($c.FINAL_POLICY -eq 'auto') { $c.FINAL_POLICY = 'DIRECT' }
   $script:C = $c
 }
 
@@ -380,7 +381,6 @@ function Invoke-Render([switch]$NoTest) {
   }
   if (-not (Test-SectionNonEmpty 'proxies')) { Die "$ProxiesFile 中没有 proxies 节点" }
   foreach ($w in Get-RuleLint) { Warn $w }
-  if ($ExitNode -and $C.FINAL_POLICY -eq 'DIRECT') { Warn '本机在用 exit node,FINAL_POLICY=DIRECT 会让未命中规则的流量绕过 exit node(建议 auto)' }
 
   $dir = $C.MIHOMO_DIR
   New-Item -ItemType Directory -Force -Path (Join-Path $dir 'providers'), $StateDir | Out-Null
@@ -778,8 +778,6 @@ function Invoke-Verify {
 
   Write-Host '== exit node =='
   Write-Host $(if ($ExitNode) { "在用 (FINAL_POLICY=$($C.FINAL_POLICY))" } else { "未用 (FINAL_POLICY=$($C.FINAL_POLICY))" })
-  $saved = Get-Content -LiteralPath (Join-Path $StateDir 'exit_node') -ErrorAction SilentlyContinue
-  if ($saved -and $saved -ne [string][int]$ExitNode) { $script:fail = $true; Write-Host 'FAIL exit node 状态在 mihomo 启动后变了,请执行: mihomo-tun restart' }
 
   Write-Host "`n== 路由走向 (Tailscale: $tsName, TUN: $($C.TUN_DEVICE)) =="
   $proxy = if ($C.VERIFY_PROXY_IP) { $C.VERIFY_PROXY_IP } else { Get-FirstServer }

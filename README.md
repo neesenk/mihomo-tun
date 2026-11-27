@@ -75,7 +75,7 @@ mihomo 的 `config.yaml` 在启动时由脚本生成(`<配置目录>/mihomo/conf
 
 开关 exit node 之后要执行 `sudo mihomo-tun restart`,`verify` 会检查状态是否一致。
 
-macOS 上 `FINAL_POLICY=auto` 总是 `DIRECT`:未命中规则的流量从本机物理网卡出网(`auto-detect-interface` 绑定物理网卡,
+macOS / Windows 上 `FINAL_POLICY=auto` 总是 `DIRECT`:未命中规则的流量从本机物理网卡出网(`auto-detect-interface` 绑定物理网卡,
 不经过 exit node),开关 exit node 不需要重启。需要 AI 等流量走 exit node / 节点时,在 rules 里显式写节点名或 `TAILSCALE`。
 
 ## 规则里写节点名
@@ -147,5 +147,6 @@ mihomo-tun confirm
 - 服务：计划任务 `\mihomo-tun\routes`（开机、网络变化、每分钟执行 `routes-up`）和 `\mihomo-tun\mihomo`（开机执行 `run`，循环运行 mihomo）
 - 分流 DNS / MagicDNS：NRPT 规则（`Get-DnsClientNrptRule`，Comment 为 `mihomo-tun*`）。mihomo 退出时会删除；异常退出时由 routes 任务兜底清理
 - TUN：mihomo 的 wintun 网卡，默认名 `mihomo-tun`
+- exit node：`FINAL_POLICY=auto` 总是 `DIRECT`，未命中规则的流量从本机出网，开关 exit node 不需要重启
 
 已知风险：Tailscale 重新配置时可能删掉它网卡上的 tailnet 路由（最多 1 分钟后由 routes 任务补回）；IPv6 和 Smart Multi-Homed Name Resolution 需要手动处理，`verify` 会提示。
