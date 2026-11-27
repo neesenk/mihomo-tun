@@ -35,6 +35,9 @@ proxies:
 #   PROXY(所有节点,类型见 mihomo-tun.conf 的 PROXY_GROUP_TYPE)、每个节点一个同名组
 # proxies 里可以写节点名、PROXY、DIRECT、TAILSCALE、REJECT 或其他代理组;
 # 也可以用 use: [nodes] + filter 按名字正则选节点(nodes 是 proxies 生成的 provider)。组名不能含空格
+# 健康检查(url-test / fallback / load-balance):
+#   proxies 列出节点时,不写 url / interval 也会检查(默认 generate_204,每 300 秒,lazy 默认开:组近期没被用到时跳过)
+#   用 use: [nodes] 时必须写 url 和 interval,否则节点不做检查,挂掉的节点仍会被选中
 proxy-groups:
   # - name: AI                   # 规则里写 AI,在面板里切换节点
   #   type: select
@@ -48,6 +51,14 @@ proxy-groups:
   # - name: FAILOVER             # 按顺序用第一个可用的,都不可用时直连
   #   type: fallback
   #   proxies: [node1, node2, DIRECT]
+  #   url: https://www.gstatic.com/generate_204
+  #   interval: 300
+  # - name: LB                   # 负载均衡:把连接分散到多个节点
+  #   type: load-balance
+  #   proxies: [node1, node2]
+  #   strategy: consistent-hashing # 同一目标固定同一节点(默认);
+  #                                # round-robin: 每个连接轮流换节点(接近随机,AI 等校验 IP 的网站慎用);
+  #                                # sticky-sessions: 同一来源+目标一段时间内固定同一节点
   #   url: https://www.gstatic.com/generate_204
   #   interval: 300
   # - name: HK                   # 名字匹配正则的节点

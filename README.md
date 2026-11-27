@@ -106,6 +106,14 @@ proxy-groups:
 rules:
   - DOMAIN-KEYWORD,openai,AI
 ```
+`load-balance` 组用 `strategy` 选分配方式:`consistent-hashing`(默认,同一目标固定同一节点)、
+`round-robin`(每个连接轮流换节点,接近随机)、`sticky-sessions`(同一来源+目标一段时间内固定同一节点)。
+AI 等会校验出口 IP 的网站不建议用 `round-robin`。
+
+健康检查:`proxies:` 列出节点时,不写 `url` / `interval` 也会检查(默认 `generate_204`,每 300 秒;
+`lazy` 默认开启,组近期没被用到时跳过)。用 `use: [nodes]` 时一定要写 `url` 和 `interval`,
+否则节点不做检查,挂掉的节点仍会被选中(mihomo v1.19.34 实测)。
+
 组名不能含空格,不能和节点、`PROXY`、`DIRECT`、`TAILSCALE`、`SYSTEM` 等内置策略重名。引用不存在的节点或组时,`mihomo -t` 校验会失败。
 
 ## MagicDNS
