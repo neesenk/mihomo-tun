@@ -65,12 +65,31 @@ rules:
   - DOMAIN-SUFFIX,youtube.com,PROXY
   - DOMAIN-SUFFIX,github.com,PROXY
   - DOMAIN-SUFFIX,githubusercontent.com,PROXY
-  - DOMAIN-SUFFIX,openai.com,PROXY
-  - DOMAIN-SUFFIX,anthropic.com,PROXY
-  - DOMAIN-SUFFIX,claude.ai,PROXY
   - DOMAIN-KEYWORD,telegram,PROXY                # 域名中包含关键字
   # - DOMAIN-WILDCARD,*.cdn.example.com,PROXY    # 通配符: * 匹配一级,? 匹配一个字符
   # - DOMAIN-REGEX,^ads?\..*$,REJECT             # 正则(慢,尽量少用)
+
+  # ---------- AI 服务(OpenAI / Anthropic)与 AI 编程工具
+  # 用 exit node 出网且要求 AI 流量只走 exit node 时,把 PROXY 换成 TAILSCALE
+  - PROCESS-PATH-REGEX,/\.local/share/claude/versions/,PROXY   # Claude Code(原生版进程名是版本号)
+  - PROCESS-NAME,codex,PROXY
+  - PROCESS-NAME,agy,PROXY                                    # Google Antigravity CLI
+  - DOMAIN-KEYWORD,anthropic,PROXY
+  - DOMAIN-KEYWORD,claude,PROXY
+  - DOMAIN-KEYWORD,openai,PROXY
+  - DOMAIN-KEYWORD,chatgpt,PROXY
+  - DOMAIN-SUFFIX,oaistatic.com,PROXY
+  - DOMAIN-SUFFIX,oaiusercontent.com,PROXY
+  # 以下补自 https://github.com/ma-wenqian/ai-proxy-rules (Clash/ai-proxy.yaml) 中关键字没覆盖到的部分
+  - DOMAIN-SUFFIX,sora.com,PROXY
+  - DOMAIN-SUFFIX,livekit.cloud,PROXY                         # ChatGPT 高级语音
+  - DOMAIN,cdn.auth0.com,PROXY                                # OpenAI 登录(auth0 多站共用)
+  - DOMAIN,client-api.arkoselabs.com,PROXY                    # OpenAI 人机验证(多站共用)
+  - DOMAIN-SUFFIX,clau.de,PROXY                               # Claude 短链
+  - DOMAIN-SUFFIX,segment.io,PROXY                            # 埋点(多站共用)
+  - DOMAIN-SUFFIX,segment.com,PROXY
+  - IP-CIDR,160.79.104.0/21,PROXY,no-resolve                  # Anthropic 自有 IP 段(AS399358)
+  - IP-CIDR6,2607:6bc0::/32,PROXY,no-resolve
 
   # ---------- 广告 / 拦截
   # - DOMAIN-SUFFIX,doubleclick.net,REJECT
