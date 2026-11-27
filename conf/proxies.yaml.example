@@ -3,8 +3,9 @@
 # 修改后执行: sudo mihomo-tun restart
 
 # ============================================================ 代理节点
-# 写法同 mihomo。不需要写 interface-name,会自动绑定到 Tailscale 网卡。
-# server 请写节点的 tailnet IP,不要写域名。
+# 写法同 mihomo。不需要写 interface-name:server 在 tailnet 内(100.64.0.0/10、TAILNET_CIDRS、*.ts.net)的节点
+# 会自动绑定 Tailscale 网卡;其余按公网节点处理,经物理网卡连接(节点里手写了 interface-name 的不改)。
+# tailnet 节点的 server 请写 tailnet IP,不要写域名。
 proxies:
   - name: node1
     type: ss

@@ -65,7 +65,7 @@ DNS_NAMESERVERS=auto
 FAKE_IP_RANGE=198.18.0.1/16
 FAKE_IP_FILTER="+.ts.net +.lan +.local"
 
-# 连接代理节点时绑定 Tailscale 网卡(节点是 tailnet 内的机器时必须为 yes)
+# 连接 tailnet 内的代理节点时绑定 Tailscale 网卡(节点是 tailnet 内的机器时必须为 yes);公网节点始终走物理网卡
 PROXY_VIA_TAILSCALE=yes
 # 代理节点组:名字(proxies.yaml 的 rules 里引用)与类型 select | url-test | fallback | load-balance
 PROXY_GROUP=PROXY

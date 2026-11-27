@@ -236,10 +236,66 @@ function Assert-Groups {
   if ($dup.Count) { Die "$ProxiesFile 中有重名的代理组: $($dup -join ' ')" }
 }
 
+$ServerRe = '(^|[{,\s])server:\s*["'']?([^"'',}\s]+)'
+
+# proxies.yaml 中各节点的 server(按出现顺序;跳过注释)
+function Get-ProxyServers {
+  foreach ($l in Get-YamlSection 'proxies') {
+    if ($l -match '^\s*#') { continue }
+    if ($l -match $ServerRe) { $Matches[2] }
+  }
+}
+
+# server 是否在 tailnet 内: Tailscale 的 100.64.0.0/10、TAILNET_CIDRS 或 *.ts.net
+function Test-TailnetServer([string]$h) {
+  if ($h -match '\.ts\.net\.?$') { return $true }
+  if (-not (Test-IPv4 $h)) { return $false }
+  foreach ($c in @('100.64.0.0/10') + @(Split-List $C.TAILNET_CIDRS)) { if (Test-InCidr $h $c) { return $true } }
+  $false
+}
+
+# 代理节点地址(verify 用):第一个 tailnet 节点的 server
 function Get-FirstServer {
-  if (-not (Test-Path -LiteralPath $ProxiesFile)) { return '' }
-  $m = Select-String -LiteralPath $ProxiesFile -Pattern 'server:\s*["'']?([^"'',}\s]+)' -Encoding UTF8 | Select-Object -First 1
-  if ($m) { $m.Matches[0].Groups[1].Value } else { '' }
+  foreach ($s in Get-ProxyServers) { if (Test-TailnetServer $s) { return $s } }
+  ''
+}
+
+# provider 文件的 proxies 部分: PROXY_VIA_TAILSCALE=yes 时给 tailnet 内的节点加上 interface-name;
+# 公网节点不绑定,由 auto-detect-interface 走物理网卡。节点里已写了 interface-name 的保持不变
+function Get-ProviderProxies([string]$tsName) {
+  $lines = @(Get-YamlSection 'proxies')
+  $items = New-Object System.Collections.Generic.List[object]
+  $cur = $null; $itemInd = -1
+  foreach ($l in $lines) {
+    if ($l -match '^(\s*)-' -and $l -notmatch '^\s*#') {
+      $ind = $Matches[1].Length
+      if ($itemInd -lt 0) { $itemInd = $ind }
+      if ($ind -eq $itemInd) { $cur = New-Object System.Collections.Generic.List[string]; $items.Add($cur) }
+    }
+    if ($null -eq $cur) { $l; continue }   # 第一个节点之前的注释
+    $cur.Add($l)
+  }
+  foreach ($it in $items) {
+    $h = ''; $bind = $false; $manual = $false
+    foreach ($l in $it) {
+      if ($l -match '^\s*#') { continue }
+      if ($l -match '(^|[{,\s])interface-name:') { $manual = $true; break }
+      if (-not $h -and $l -match $ServerRe) { $h = $Matches[2] }
+    }
+    if (-not $manual -and $C.PROXY_VIA_TAILSCALE -eq 'yes' -and $h -and (Test-TailnetServer $h)) { $bind = $true }
+    for ($i = 0; $i -lt $it.Count; $i++) {
+      $l = $it[$i]
+      if ($i -eq 0 -and $bind -and $l -match '^\s*-\s*\{') {
+        ([regex]'\{').Replace($l, "{ interface-name: `"$tsName`",", 1); continue
+      }
+      $l
+      if ($i -eq 0 -and $bind) {
+        if ($l -match '^\s*-\s*$' -and $it.Count -gt 1) { $ind = ($it[1] -replace '^(\s*).*', '$1').Length }
+        else { $ind = ($l -replace '^(\s*-\s*).*', '$1').Length }
+        (' ' * $ind) + "interface-name: `"$tsName`"    # mihomo-tun: tailnet 节点绑定 Tailscale 网卡"
+      }
+    }
+  }
 }
 
 # 找出被前面更宽的 DOMAIN-SUFFIX / 相同 DOMAIN 覆盖、永远匹配不到的规则
@@ -356,11 +412,7 @@ function New-MihomoYaml([string]$tsName) {
     'proxy-providers:'
     "  ${PROVIDER}:"
     '    type: file'
-    '    path: ./providers/proxies.yaml')
-  if ($C.PROXY_VIA_TAILSCALE -eq 'yes') {
-    & $add '    override:'
-    & $add "      interface-name: `"$tsName`"    # 连接代理节点的 socket 绑定 Tailscale 网卡"
-  }
+    '    path: ./providers/proxies.yaml   # tailnet 节点已在文件里绑定 Tailscale 网卡(见 Get-ProviderProxies)')
   $hc = @('url-test', 'fallback', 'load-balance') -contains $C.PROXY_GROUP_TYPE
   if ($hc) { & $add @('    health-check:', '      enable: true', "      url: $($C.HEALTH_CHECK_URL)", '      interval: 300') }
 
@@ -406,8 +458,9 @@ function Invoke-Render([switch]$NoTest) {
   if (-not $ts) { Die '未找到 Tailscale 网卡,Tailscale 是否已连接?(也可在配置里设置 TS_IFACE)' }
 
   if ($C.PROXY_VIA_TAILSCALE -eq 'yes') {
-    $s = Get-FirstServer
-    if ($s -and -not (Test-IPv4 $s)) { Warn "代理节点 server 是域名($s),建议写 tailnet IP" }
+    foreach ($s in Get-ProxyServers) {
+      if (-not (Test-IPv4 $s) -and -not (Test-TailnetServer $s)) { Warn "代理节点 server 是域名($s),按公网节点处理(不绑定 Tailscale 网卡);tailnet 节点请写 tailnet IP" }
+    }
   }
   foreach ($k in Get-YamlTopKeys) {
     if (@('proxies', 'proxy-groups', 'rules', 'rule-providers') -notcontains $k) { Warn "$ProxiesFile 中的顶层键 $k 会被忽略(只支持 proxies / proxy-groups / rules / rule-providers)" }
@@ -418,7 +471,7 @@ function Invoke-Render([switch]$NoTest) {
 
   $dir = $C.MIHOMO_DIR
   New-Item -ItemType Directory -Force -Path (Join-Path $dir 'providers'), $StateDir | Out-Null
-  $prov = "proxies:`n" + ((@(Get-YamlSection 'proxies')) -join "`n") + "`n"
+  $prov = "proxies:`n" + ((@(Get-ProviderProxies $ts.Name)) -join "`n") + "`n"
   Write-Utf8NoBom (Join-Path $dir 'providers\proxies.yaml') $prov
   $tmp = Join-Path $dir '.config.yaml.tmp'
   Write-Utf8NoBom $tmp (New-MihomoYaml $ts.Name)

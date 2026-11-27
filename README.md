@@ -43,7 +43,7 @@ sudo mihomo-tun uninstall --all -y        # 连 mihomo 二进制一起删,不确
 | 文件 | 内容 |
 |---|---|
 | `mihomo-tun.conf` | 网络参数(tailnet 网段、本地网段、端口、DNS、TUN 等),shell 语法 |
-| `proxies.yaml` | `proxies`(代理节点,写法同 mihomo,**不用写 `interface-name`**)、`rules`(分流规则,策略可用 `PROXY` / `DIRECT` / `REJECT` / `TAILSCALE` / `SYSTEM`,示例里有各类规则的写法)、可选的 `rule-providers`(供 `RULE-SET` 使用) |
+| `proxies.yaml` | `proxies`(代理节点,写法同 mihomo,**不用写 `interface-name`**,tailnet 节点自动绑定 Tailscale 网卡)、可选的 `proxy-groups`、`rules`(分流规则,策略可用 `PROXY` / `DIRECT` / `REJECT` / `TAILSCALE` / `SYSTEM`,示例里有各类规则的写法)、可选的 `rule-providers`(供 `RULE-SET` 使用) |
 
 mihomo 的 `config.yaml` 在启动时由脚本生成(`<配置目录>/mihomo/config.yaml`),不要手动修改它。
 
@@ -62,8 +62,9 @@ mihomo 的 `config.yaml` 在启动时由脚本生成(`<配置目录>/mihomo/conf
   Tailscale 的 utun 编号变化时,会自动重启 mihomo 以更新绑定的网卡
 
 **mihomo 侧**
-- `auto-detect-interface` 会把出站 socket 绑定到物理网卡,所以代理节点要通过 provider 的
-  `override.interface-name` 绑定到 Tailscale 网卡,MagicDNS 查询也要走绑定了该网卡的 `TAILSCALE` 出口
+- `auto-detect-interface` 会把出站 socket 绑定到物理网卡,所以 tailnet 内的代理节点(server 在 `100.64.0.0/10`、
+  `TAILNET_CIDRS` 或 `*.ts.net`)生成 provider 文件时会逐个加上 `interface-name`,绑定到 Tailscale 网卡;
+  公网节点(如 VPS 上的 vless/reality)不绑定,经物理网卡连接。MagicDNS 查询也要走绑定了该网卡的 `TAILSCALE` 出口
 - 不开 `auto-redirect`,避免和 Tailscale 的 netfilter 规则冲突
 
 ## exit node

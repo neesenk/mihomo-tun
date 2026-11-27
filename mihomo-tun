@@ -260,11 +260,78 @@ bypass_cidrs() {
   echo $TAILNET_CIDRS ${MAGICDNS_IP:+$MAGICDNS_IP/32} $LOCAL_CIDRS
 }
 
-# 代理节点地址(取 proxies.yaml 中第一个 server)
-first_server() {
+# proxies.yaml 中各节点的 server(每行一个,按出现顺序;跳过注释)
+proxy_servers() {
   [ -f "$PROXIES_FILE" ] || return 0
-  grep -Eo 'server:[[:space:]]*["'\'']?[^",'\''}[:space:]]+' "$PROXIES_FILE" | head -1 \
-    | sed -E 's/server:[[:space:]]*["'\'']?//'
+  yaml_section "$PROXIES_FILE" proxies | grep -v '^[[:space:]]*#' \
+    | grep -Eo '(^|[{,[:space:]])server:[[:space:]]*["'\'']?[^",'\''}[:space:]]+' \
+    | sed -E 's/.*server:[[:space:]]*["'\'']?//'
+}
+
+# server 是否在 tailnet 内: Tailscale 的 100.64.0.0/10、TAILNET_CIDRS 或 *.ts.net
+is_tailnet_server() {
+  local c
+  case $1 in *.ts.net|*.ts.net.) return 0 ;; esac
+  is_ipv4 "$1" || return 1
+  for c in 100.64.0.0/10 $TAILNET_CIDRS; do in_cidr "$1" "$c" && return 0; done
+  return 1
+}
+
+# 代理节点地址(verify 用):第一个 tailnet 节点的 server
+first_server() {
+  local s
+  for s in $(proxy_servers); do is_tailnet_server "$s" && { echo "$s"; return; }; done
+}
+
+# provider 文件的 proxies 部分: PROXY_VIA_TAILSCALE=yes 时给 tailnet 内的节点加上 interface-name,
+# 让连接节点的 socket 绑定 Tailscale 网卡;公网节点不绑定,由 auto-detect-interface 走物理网卡。
+# 节点里已写了 interface-name 的保持不变
+provider_proxies() {  # provider_proxies <Tailscale 网卡>
+  yaml_section "$PROXIES_FILE" proxies | awk -v ifn="$1" -v via="$PROXY_VIA_TAILSCALE" -v cidrs="100.64.0.0/10 $TAILNET_CIDRS" '
+    function ip2int(ip,  a) { split(ip, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+    function in_cidr(ip, c,  p, len, size) {
+      split(c, p, "/"); len = (p[2] == "" ? 32 : p[2]); size = 2 ^ (32 - len)
+      return int(ip2int(ip) / size) == int(ip2int(p[1]) / size)
+    }
+    function is_ts(h,  i, n, arr) {
+      if (h ~ /\.ts\.net\.?$/) return 1
+      if (h !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+      n = split(cidrs, arr, " ")
+      for (i = 1; i <= n; i++) if (in_cidr(h, arr[i])) return 1
+      return 0
+    }
+    function flush(  i, h, bind, ind) {
+      if (!cnt) return
+      h = ""; bind = 0
+      for (i = 1; i <= cnt; i++) {
+        if (buf[i] ~ /^[[:space:]]*#/) continue
+        if (buf[i] ~ /(^|[{,[:space:]])interface-name:/) { h = ""; bind = -1; break }
+        if (h == "" && match(buf[i], /(^|[{,[:space:]])server:[[:space:]]*["\047]?[^"\047,}[:space:]]+/)) {
+          h = substr(buf[i], RSTART, RLENGTH); sub(/.*server:[[:space:]]*["\047]?/, "", h)
+        }
+      }
+      if (bind == 0 && via == "yes" && h != "" && is_ts(h)) bind = 1
+      for (i = 1; i <= cnt; i++) {
+        if (i == 1 && bind == 1 && buf[1] ~ /^[[:space:]]*-[[:space:]]*\{/) {
+          l = buf[1]; sub(/\{/, "{ interface-name: \"" ifn "\",", l); print l; continue
+        }
+        print buf[i]
+        if (i == 1 && bind == 1) {
+          if (buf[1] ~ /^[[:space:]]*-[[:space:]]*$/ && cnt > 1) { match(buf[2], /^[[:space:]]*/); ind = RLENGTH }
+          else { match(buf[1], /^[[:space:]]*-[[:space:]]*/); ind = RLENGTH }
+          printf "%*sinterface-name: \"%s\"    # mihomo-tun: tailnet 节点绑定 Tailscale 网卡\n", ind, "", ifn
+        }
+      }
+      cnt = 0
+    }
+    # 列表项开头(与第一个列表项同缩进)
+    /^[[:space:]]*-/ && !/^[[:space:]]*#/ {
+      match($0, /^[[:space:]]*/)
+      if (item_ind == "") item_ind = RLENGTH
+      if (RLENGTH == item_ind) flush()
+    }
+    { buf[++cnt] = $0 }
+    END { flush() }'
 }
 
 # ---------------------------------------------------------------- Tailscale 网卡
@@ -599,14 +666,8 @@ proxies:
 proxy-providers:
   $PROVIDER:
     type: file
-    path: ./providers/proxies.yaml
+    path: ./providers/proxies.yaml   # tailnet 节点已在文件里绑定 Tailscale 网卡(见 provider_proxies)
 EOF
-  if [ "$PROXY_VIA_TAILSCALE" = yes ]; then
-    cat <<EOF
-    override:
-      interface-name: $ts_if    # 关键: 连接代理节点的 socket 绑定 Tailscale 网卡,而不是物理网卡
-EOF
-  fi
   case $PROXY_GROUP_TYPE in
     url-test|fallback|load-balance)
       cat <<EOF
@@ -711,10 +772,12 @@ cmd_render() {
   ts_if=$(ts_iface) || die "未找到 Tailscale 网卡,Tailscale 是否已连接?(也可在配置里设置 TS_IFACE)"
 
   if [ "$PROXY_VIA_TAILSCALE" = yes ]; then
-    local s; s=$(first_server)
-    if [ -n "$s" ] && ! is_ipv4 "$s"; then
-      warn "代理节点 server 是域名($s),建议写 tailnet IP,避免解析/路由绕回物理网卡"
-    fi
+    local s
+    for s in $(proxy_servers); do
+      if ! is_ipv4 "$s" && ! is_tailnet_server "$s"; then
+        warn "代理节点 server 是域名($s),按公网节点处理(不绑定 Tailscale 网卡);tailnet 节点请写 tailnet IP"
+      fi
+    done
   fi
 
   local k
@@ -740,7 +803,7 @@ cmd_render() {
   mkdir -p "$MIHOMO_DIR/providers" "$STATE_DIR"
   # provider 文件里只放 proxies 部分
   ( umask 077
-    { echo "proxies:"; yaml_section "$PROXIES_FILE" proxies; } >"$MIHOMO_DIR/providers/proxies.yaml" )
+    { echo "proxies:"; provider_proxies "$ts_if"; } >"$MIHOMO_DIR/providers/proxies.yaml" )
   tmp=$MIHOMO_DIR/.config.yaml.$$
   render_yaml "$ts_if" >"$tmp" || { rm -f "$tmp"; die "生成配置失败"; }
   chmod 0600 "$tmp"
