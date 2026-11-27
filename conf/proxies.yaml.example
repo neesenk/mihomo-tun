@@ -1,5 +1,5 @@
 # 代理节点与分流规则。
-# 支持的顶层键: proxies、rules、rule-providers;其余部分(tun/dns/proxy-groups…)由 mihomo-tun 生成。
+# 支持的顶层键: proxies、proxy-groups、rules、rule-providers;其余部分(tun/dns…)由 mihomo-tun 生成。
 # 修改后执行: sudo mihomo-tun restart
 
 # ============================================================ 代理节点
@@ -30,6 +30,33 @@ proxies:
   #   tls: true
   #   servername: example.com
 
+# ============================================================ 代理组(可选)
+# 写法同 mihomo,原样追加到生成的组后面。已自动生成的组(不要重名):
+#   PROXY(所有节点,类型见 mihomo-tun.conf 的 PROXY_GROUP_TYPE)、每个节点一个同名组
+# proxies 里可以写节点名、PROXY、DIRECT、TAILSCALE、REJECT 或其他代理组;
+# 也可以用 use: [nodes] + filter 按名字正则选节点(nodes 是 proxies 生成的 provider)。组名不能含空格
+proxy-groups:
+  # - name: AI                   # 规则里写 AI,在面板里切换节点
+  #   type: select
+  #   proxies: [node1, node2, PROXY]
+  # - name: AUTO                 # 自动选延迟最低的节点
+  #   type: url-test
+  #   use: [nodes]
+  #   url: https://www.gstatic.com/generate_204
+  #   interval: 300
+  #   tolerance: 50
+  # - name: FAILOVER             # 按顺序用第一个可用的,都不可用时直连
+  #   type: fallback
+  #   proxies: [node1, node2, DIRECT]
+  #   url: https://www.gstatic.com/generate_204
+  #   interval: 300
+  # - name: HK                   # 名字匹配正则的节点
+  #   type: url-test
+  #   use: [nodes]
+  #   filter: "(?i)hk|香港"
+  #   url: https://www.gstatic.com/generate_204
+  #   interval: 300
+
 # ============================================================ 规则集(可选)
 # 给下面的 RULE-SET 规则用。path 必须在 mihomo 工作目录内,用 ./ 开头的相对路径。
 # http 类型的规则集由 mihomo 下载,proxy 可指定经代理下载。
@@ -53,7 +80,7 @@ rule-providers:
 # 策略: PROXY(所有节点组成的组)、DIRECT(物理网卡直连)、REJECT(拒绝)、
 #       REJECT-DROP(静默丢弃)、TAILSCALE(经 Tailscale 网卡直连)
 #       SYSTEM(按没有 mihomo 时的系统路由走:本地网段直连,其余按 FINAL_POLICY,适合排除系统 agent)
-#       也可以直接写节点名(如 node1),把某些流量固定发给指定节点
+#       也可以直接写节点名(如 node1),把某些流量固定发给指定节点,或写上面 proxy-groups 中的组名
 # 已自动加在最前面: ts.net / tailnet 网段 -> TAILSCALE,LOCAL_CIDRS -> DIRECT
 # 已自动加在最后面: MATCH,<FINAL_POLICY>(在 mihomo-tun.conf 中设置)
 rules:

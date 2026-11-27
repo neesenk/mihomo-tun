@@ -113,6 +113,35 @@ proxy_names() {
     | sed -nE 's/^[[:space:]]*-?[[:space:]]*\{?[[:space:]]*name:[[:space:]]*["'\'']?([^"'\'',}[:space:]]+).*/\1/p'
 }
 
+# proxies.yaml 中自定义的代理组:去掉整行注释和空行,统一成 2 空格缩进的列表项
+user_groups() {
+  yaml_section "$PROXIES_FILE" proxy-groups | awk '
+    /^[[:space:]]*(#.*)?$/ { next }
+    { n++; l[n] = $0; match($0, /^[[:space:]]*/); if (min == "" || RLENGTH < min) min = RLENGTH }
+    END { for (i = 1; i <= n; i++) print "  " substr(l[i], min + 1) }'
+}
+
+# 自定义代理组的名字(只看列表项第一层的 name,名字里不能有空格)
+group_names() {
+  user_groups | sed -nE 's/^  -[[:space:]]*\{?[[:space:]]*name:[[:space:]]*["'\'']?([^"'\'',}[:space:]]+).*/\1/p'
+}
+
+# 检查自定义代理组:名字不能与内置策略或节点重名
+check_groups() {
+  local g n
+  [ -n "$(user_groups)" ] || return 0
+  user_groups | sed -nE 's/^  -[[:space:]]*\{?[[:space:]]*name:[[:space:]]*["'\'']?([^"'\'',}#]*).*/\1/p' \
+    | sed 's/[[:space:]]*$//' | grep -q '[[:space:]]' && die "$PROXIES_FILE 中 proxy-groups 的组名不能含空格"
+  for g in $(group_names); do
+    case $g in "$PROXY_GROUP"|"$TS_DIRECT"|"$SYSTEM_POLICY"|DIRECT|REJECT|REJECT-DROP|PASS|COMPATIBLE|GLOBAL)
+      die "$PROXIES_FILE 中的代理组 $g 与内置策略重名" ;; esac
+    for n in $(proxy_names); do
+      [ "$g" = "$n" ] && die "$PROXIES_FILE 中的代理组 $g 与节点重名(规则里写节点名时会冲突)"
+    done
+  done
+  [ -z "$(group_names | sort | uniq -d)" ] || die "$PROXIES_FILE 中有重名的代理组: $(group_names | sort | uniq -d | tr '\n' ' ')"
+}
+
 yaml_list() {  # yaml_list <缩进> <项...>
   local ind=$1 x; shift
   for x in "$@"; do printf '%s- "%s"\n' "$ind" "$x"; done
@@ -616,6 +645,13 @@ EOF
 EOF
   done
 
+  # 自定义代理组原样追加,可以引用节点名(上面的同名组)、$PROXY_GROUP、DIRECT、$TS_DIRECT,
+  # 或用 use: [$PROVIDER] + filter 按名字选节点
+  if [ -n "$(user_groups)" ]; then
+    echo "  # ---- $PROXIES_FILE 中的 proxy-groups"
+    user_groups
+  fi
+
   # rule-providers 原样透传(供 RULE-SET 规则使用)
   if [ -n "$(yaml_section "$PROXIES_FILE" rule-providers | grep -v '^[[:space:]]*\(#.*\)\{0,1\}$')" ]; then
     echo
@@ -683,9 +719,10 @@ cmd_render() {
 
   local k
   for k in $(yaml_top_keys "$PROXIES_FILE"); do
-    case $k in proxies|rules|rule-providers) ;;
-      *) warn "$PROXIES_FILE 中的顶层键 $k 会被忽略(只支持 proxies / rules / rule-providers)" ;; esac
+    case $k in proxies|proxy-groups|rules|rule-providers) ;;
+      *) warn "$PROXIES_FILE 中的顶层键 $k 会被忽略(只支持 proxies / proxy-groups / rules / rule-providers)" ;; esac
   done
+  check_groups
   [ -n "$(yaml_section "$PROXIES_FILE" proxies | grep -v '^[[:space:]]*\(#.*\)\{0,1\}$')" ] \
     || die "$PROXIES_FILE 中没有 proxies 节点"
   local w

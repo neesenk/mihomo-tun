@@ -207,6 +207,35 @@ function Get-ProxyNames {
   }
 }
 
+# proxies.yaml 中自定义的代理组:去掉整行注释和空行,统一成 2 空格缩进的列表项
+function Get-UserGroups {
+  $ls = @(Get-YamlSection 'proxy-groups' | Where-Object { $_ -notmatch '^\s*(#.*)?$' })
+  if (-not $ls.Count) { return @() }
+  $min = ($ls | ForEach-Object { ($_ -replace '^(\s*).*', '$1').Length } | Measure-Object -Minimum).Minimum
+  foreach ($l in $ls) { '  ' + $l.Substring($min) }
+}
+
+# 自定义代理组的名字(只看列表项第一层的 name)
+function Get-GroupNames {
+  foreach ($l in Get-UserGroups) {
+    if ($l -match '^  -\s*\{?\s*name:\s*["'']?([^"'',}#]*)') { $Matches[1].TrimEnd() }
+  }
+}
+
+# 检查自定义代理组:名字不能含空格,不能与内置策略、节点或彼此重名
+function Assert-Groups {
+  $names = @(Get-GroupNames)
+  $reserved = @($C.PROXY_GROUP, $TS_DIRECT, $SYSTEM_POLICY, 'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL')
+  $nodes = @(Get-ProxyNames)
+  foreach ($g in $names) {
+    if ($g -match '\s') { Die "$ProxiesFile 中 proxy-groups 的组名不能含空格: $g" }
+    if ($reserved -contains $g) { Die "$ProxiesFile 中的代理组 $g 与内置策略重名" }
+    if ($nodes -contains $g) { Die "$ProxiesFile 中的代理组 $g 与节点重名(规则里写节点名时会冲突)" }
+  }
+  $dup = @($names | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+  if ($dup.Count) { Die "$ProxiesFile 中有重名的代理组: $($dup -join ' ')" }
+}
+
 function Get-FirstServer {
   if (-not (Test-Path -LiteralPath $ProxiesFile)) { return '' }
   $m = Select-String -LiteralPath $ProxiesFile -Pattern 'server:\s*["'']?([^"'',}\s]+)' -Encoding UTF8 | Select-Object -First 1
@@ -344,6 +373,10 @@ function New-MihomoYaml([string]$tsName) {
     & $add @("  - name: $n", '    type: select', "    use: [$PROVIDER]", "    filter: `"^$re`$`"")
   }
 
+  # 自定义代理组原样追加,可以引用节点名(上面的同名组)、PROXY、DIRECT、TAILSCALE,或用 use: [nodes] + filter
+  $ug = @(Get-UserGroups)
+  if ($ug.Count) { & $add "  # ---- $ProxiesFile 中的 proxy-groups"; & $add $ug }
+
   if (Test-SectionNonEmpty 'rule-providers') {
     & $add @('', 'rule-providers:'); & $add @(Get-YamlSection 'rule-providers')
   }
@@ -377,8 +410,9 @@ function Invoke-Render([switch]$NoTest) {
     if ($s -and -not (Test-IPv4 $s)) { Warn "代理节点 server 是域名($s),建议写 tailnet IP" }
   }
   foreach ($k in Get-YamlTopKeys) {
-    if (@('proxies', 'rules', 'rule-providers') -notcontains $k) { Warn "$ProxiesFile 中的顶层键 $k 会被忽略" }
+    if (@('proxies', 'proxy-groups', 'rules', 'rule-providers') -notcontains $k) { Warn "$ProxiesFile 中的顶层键 $k 会被忽略(只支持 proxies / proxy-groups / rules / rule-providers)" }
   }
+  Assert-Groups
   if (-not (Test-SectionNonEmpty 'proxies')) { Die "$ProxiesFile 中没有 proxies 节点" }
   foreach ($w in Get-RuleLint) { Warn $w }
 

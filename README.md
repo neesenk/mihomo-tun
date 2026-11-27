@@ -87,6 +87,27 @@ macOS / Windows 上 `FINAL_POLICY=auto` 总是 `DIRECT`:未命中规则的流量
 ```
 规则按从上到下的顺序匹配,更具体的要写在前面。生成配置时会检查被前面规则覆盖、永远匹配不到的规则,并给出警告。
 
+## 代理组
+
+`proxies.yaml` 里可以写 `proxy-groups`,写法和 mihomo 一样,会原样追加到自动生成的组(`PROXY` 和每个节点的同名组)后面:
+```yaml
+proxy-groups:
+  - name: AI
+    type: fallback                 # 按顺序用第一个可用的
+    proxies: [sg, vm, DIRECT]      # 节点名、PROXY、DIRECT、TAILSCALE、REJECT 或其他组
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+  - name: AUTO
+    type: url-test
+    use: [nodes]                   # 所有节点;可加 filter 按名字正则筛选
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+
+rules:
+  - DOMAIN-KEYWORD,openai,AI
+```
+组名不能含空格,不能和节点、`PROXY`、`DIRECT`、`TAILSCALE`、`SYSTEM` 等内置策略重名。引用不存在的节点或组时,`mihomo -t` 校验会失败。
+
 ## MagicDNS
 
 tailscale 没开 accept-dns 时,系统解析不了 `*.ts.net` 和节点短名。`routes-up` 会在 systemd-resolved 的
