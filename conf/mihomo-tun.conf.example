@@ -72,7 +72,8 @@ PROXY_GROUP=PROXY
 PROXY_GROUP_TYPE=select
 HEALTH_CHECK_URL=https://www.gstatic.com/generate_204
 # 没有命中任何规则时的策略:DIRECT、PROXY、TAILSCALE
-# auto: 在用 exit node 时为 TAILSCALE(继续经 exit node 出网),否则为 DIRECT。开关 exit node 后需 sudo mihomo-tun restart
+# auto: Linux 在用 exit node 时为 TAILSCALE(继续经 exit node 出网),否则为 DIRECT,开关 exit node 后需 sudo mihomo-tun restart;
+#       macOS 总是 DIRECT(从本机物理网卡出网,与 exit node 开关无关)
 FINAL_POLICY=auto
 
 # ---------------- verify ----------------

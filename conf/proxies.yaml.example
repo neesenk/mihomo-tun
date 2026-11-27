@@ -62,6 +62,7 @@ rules:
   - DOMAIN-SUFFIX,google.com,PROXY               # 匹配 google.com 及其所有子域名
   - DOMAIN-SUFFIX,googleapis.com,PROXY
   - DOMAIN-SUFFIX,gstatic.com,PROXY
+  - DOMAIN-SUFFIX,googleusercontent.com,PROXY
   - DOMAIN-SUFFIX,youtube.com,PROXY
   - DOMAIN-SUFFIX,github.com,PROXY
   - DOMAIN-SUFFIX,githubusercontent.com,PROXY
@@ -74,6 +75,10 @@ rules:
   - PROCESS-PATH-REGEX,/\.local/share/claude/versions/,PROXY   # Claude Code(原生版进程名是版本号)
   - PROCESS-NAME,codex,PROXY
   - PROCESS-NAME,agy,PROXY                                    # Google Antigravity CLI
+  - PROCESS-PATH-REGEX,^/Applications/Claude\.app/,PROXY        # Claude 桌面版(含 helper,macOS)
+  - PROCESS-PATH-REGEX,^/Applications/ChatGPT\.app/,PROXY       # ChatGPT / Codex 桌面版(含 helper,macOS)
+  - PROCESS-PATH-REGEX,^/Applications/Antigravity\.app/,PROXY   # Antigravity 桌面版(含 helper,macOS)
+  - PROCESS-PATH-REGEX,/(\.codex|Library/Application Support/Codex)/,PROXY   # Codex 运行时 / computer-use
   - DOMAIN-KEYWORD,anthropic,PROXY
   - DOMAIN-KEYWORD,claude,PROXY
   - DOMAIN-KEYWORD,openai,PROXY

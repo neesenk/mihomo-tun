@@ -75,6 +75,9 @@ mihomo 的 `config.yaml` 在启动时由脚本生成(`<配置目录>/mihomo/conf
 
 开关 exit node 之后要执行 `sudo mihomo-tun restart`,`verify` 会检查状态是否一致。
 
+macOS 上 `FINAL_POLICY=auto` 总是 `DIRECT`:未命中规则的流量从本机物理网卡出网(`auto-detect-interface` 绑定物理网卡,
+不经过 exit node),开关 exit node 不需要重启。需要 AI 等流量走 exit node / 节点时,在 rules 里显式写节点名或 `TAILSCALE`。
+
 ## 规则里写节点名
 
 每个节点会自动生成一个同名的组,规则里可以直接写节点名,把某类流量固定发给某个节点:

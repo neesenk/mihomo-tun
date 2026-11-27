@@ -170,16 +170,18 @@ load_conf() {
 
   [ -n "$MIHOMO_DIR" ] || MIHOMO_DIR=$CONF_DIR/mihomo
 
-  # 本机用了 Tailscale exit node 时:
+  # 本机用了 Tailscale exit node 时(仅 Linux):
   #   mihomo 的策略路由要排到 Tailscale 的 5270 之前(否则公网流量全被 exit node 拿走,进不了 TUN);
   #   未命中规则的流量走 TAILSCALE 出口,保持经 exit node 出网
+  # macOS 是办公机,未命中规则的流量从本机出网(DIRECT 绑定物理网卡,不经过 exit node),
+  # 这样开关 exit node 都不影响兜底流量
   EXIT_NODE=0
   ts_exit_node_active && EXIT_NODE=1
   if [ "$TUN_RULE_INDEX" = auto ]; then
     if [ "$OS" = linux ] && [ $EXIT_NODE = 1 ]; then TUN_RULE_INDEX=5255; else TUN_RULE_INDEX=""; fi
   fi
   if [ "$FINAL_POLICY" = auto ]; then
-    if [ $EXIT_NODE = 1 ]; then FINAL_POLICY=$TS_DIRECT; else FINAL_POLICY=DIRECT; fi
+    if [ "$OS" = linux ] && [ $EXIT_NODE = 1 ]; then FINAL_POLICY=$TS_DIRECT; else FINAL_POLICY=DIRECT; fi
   fi
   if [ "$TUN_DEVICE" = auto ]; then
     # macOS 的 TUN 设备名必须是 utunN
@@ -622,7 +624,7 @@ EOF
   fi
 
   # SYSTEM: "就像没有 mihomo 一样" —— 本地/内网直连,tailnet 走 Tailscale,其余按 FINAL_POLICY
-  # (用了 exit node 时 FINAL_POLICY=TAILSCALE,即走 exit node)。规则里写策略 SYSTEM 即可使用
+  # (Linux 用了 exit node 时 FINAL_POLICY=TAILSCALE,即走 exit node)。规则里写策略 SYSTEM 即可使用
   echo
   echo "sub-rules:"
   echo "  $SYSTEM_POLICY:"
@@ -1280,7 +1282,8 @@ cmd_verify() {
   echo "== exit node =="
   if [ $EXIT_NODE = 1 ]; then echo "在用 (TUN_RULE_INDEX=${TUN_RULE_INDEX:-默认}, FINAL_POLICY=$FINAL_POLICY)"
   else echo "未用 (FINAL_POLICY=$FINAL_POLICY)"; fi
-  if [ -f "$STATE_DIR/exit_node" ] && [ "$(cat "$STATE_DIR/exit_node")" != "$EXIT_NODE" ]; then
+  # macOS 上 exit node 状态不影响生成的配置,只在 Linux 上检查
+  if [ "$OS" = linux ] && [ -f "$STATE_DIR/exit_node" ] && [ "$(cat "$STATE_DIR/exit_node")" != "$EXIT_NODE" ]; then
     fail=1; echo "FAIL exit node 状态在 mihomo 启动后变了,请执行: sudo mihomo-tun restart"
   fi
   echo
