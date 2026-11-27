@@ -1,3 +1,9 @@
 # 本机实际配置,含代理密码和 API secret
 conf/mihomo-tun.conf
 conf/proxies.yaml
+
+# 编辑器临时文件(可能含密码)
+*.swp
+*.swo
+*~
+.DS_Store
